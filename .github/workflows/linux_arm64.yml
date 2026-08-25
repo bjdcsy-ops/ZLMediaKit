@@ -1,87 +1,93 @@
-name: Linux_ARM64
+name: Build ZLMediaKit
 
-on: [push, pull_request]
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: zlmediakit-build-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
-
-    runs-on: ubuntu-24.04-arm
+    name: Linux ARM64 build
+    runs-on: ubuntu-22.04-arm
+    timeout-minutes: 120
 
     steps:
-    - uses: actions/checkout@v4
+      - name: Checkout ZLMediaKit
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
 
-    - name: 下载submodule源码
-      run: mv -f .gitmodules_github .gitmodules && git submodule sync && git submodule update --init
+      - name: Prepare Debian 11 ARM64 build image
+        run: ./build-linux-arm64.sh image
 
-    - name: 下载 SRTP
-      uses: actions/checkout@v4
-      with:
-        repository: cisco/libsrtp
-        fetch-depth: 1
-        ref: v2.3.0
-        path: 3rdpart/libsrtp
+      - name: Resolve build cache metadata
+        id: build_cache
+        run: ./build-linux-arm64.sh cache-info >>"$GITHUB_OUTPUT"
 
-    - name: 下载 openssl
-      uses: actions/checkout@v4
-      with:
-        repository: openssl/openssl
-        fetch-depth: 1
-        ref: OpenSSL_1_1_1
-        path: 3rdpart/openssl
+      - name: Restore dependency cache
+        id: dependency_cache
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ steps.build_cache.outputs.dependency_cache_path }}
+          key: zlmediakit-deps-debian11-arm64-${{ steps.build_cache.outputs.dependency_cache_key }}
 
-    - name: 下载 usrsctp
-      uses: actions/checkout@v4
-      with:
-        repository: sctplab/usrsctp
-        fetch-depth: 1
-        ref: 0.9.5.0
-        path: 3rdpart/usrsctp
+      - name: Restore compiler cache
+        id: ccache
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ steps.build_cache.outputs.ccache_path }}
+          key: zlmediakit-ccache-debian11-arm64-${{ steps.build_cache.outputs.builder_fingerprint }}-${{ github.sha }}
+          restore-keys: |
+            zlmediakit-ccache-debian11-arm64-${{ steps.build_cache.outputs.builder_fingerprint }}-
 
-    # Use Debian 11 (glibc 2.31) for broader binary compatibility.
-    # ubuntu:20.04 is EOL and apt mirrors often fail in 2026.
-    - name: 在 Docker(debian:11/arm64) 中编译
-      run: |
-        set -eux
-        chmod +x package/build_linux_arm64.sh
-        docker version
-        docker pull --platform linux/arm64 debian:11
-        docker run --platform linux/arm64 --rm \
-          -v "${GITHUB_WORKSPACE}:/work" \
-          -w /work \
-          debian:11 \
-          bash /work/package/build_linux_arm64.sh
+      - name: Validate build files
+        run: ./build-linux-arm64.sh check
 
-    - name: 设置环境变量
-      run: |
-        echo "BRANCH=$(echo ${GITHUB_REF#refs/heads/} | tr -s "/\?%*:|\"<>" "_")" >> $GITHUB_ENV
-        echo "BRANCH2=$(echo ${GITHUB_REF#refs/heads/} )" >> $GITHUB_ENV
-        echo "DATE=$(date +%Y-%m-%d)" >> $GITHUB_ENV
+      - name: Build ZLMediaKit package
+        run: ./build-linux-arm64.sh build
 
-    - name: 打包二进制
-      id: upload
-      uses: actions/upload-artifact@v4
-      with:
-        name: ${{ github.workflow }}_${{ env.BRANCH }}_${{ env.DATE }}
-        path: release/*
-        if-no-files-found: error
-        retention-days: 90
+      - name: Archive ZLMediaKit package
+        id: archive
+        run: |
+          archive_path=$(./build-linux-arm64.sh archive)
+          printf 'path=%s\n' "$archive_path" >>"$GITHUB_OUTPUT"
 
-    - name: issue评论
-      if: github.event_name != 'pull_request' && github.ref != 'refs/heads/feature/test'
-      uses: actions/github-script@v7
-      with:
-        github-token: ${{ secrets.GITHUB_TOKEN }}
-        script: |
-          github.rest.issues.createComment({
-            issue_number: ${{vars.VERSION_ISSUE_NO}},
-            owner: context.repo.owner,
-            repo: context.repo.repo,
-            body: '- 下载地址: [${{ github.workflow }}_${{ env.BRANCH }}_${{ env.DATE }}](${{ steps.upload.outputs.artifact-url }})\n'
-              + '- 分支: ${{ env.BRANCH2 }}\n'
-              + '- git hash: ${{ github.sha }} \n'
-              + '- 编译日期: ${{ env.DATE }}\n'
-              + '- 编译记录: [${{ github.run_id }}](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})\n'
-              + '- 打包ci名: ${{ github.workflow }}\n'
-              + '- 开启特性: openssl/webrtc/datachannel\n'
-              + '- 说明: 本二进制为 linux/arm64(aarch64)，在 debian:11(arm64, glibc 2.31) 上编译，目标机需 arm64 且 glibc >= 2.31\n'
-          })
+      - name: Save dependency cache
+        if: steps.dependency_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ steps.build_cache.outputs.dependency_cache_path }}
+          key: ${{ steps.dependency_cache.outputs.cache-primary-key }}
+
+      - name: Save compiler cache
+        if: success() && steps.ccache.outcome == 'success' && steps.ccache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ steps.build_cache.outputs.ccache_path }}
+          key: ${{ steps.ccache.outputs.cache-primary-key }}
+
+      - name: Attest ZLMediaKit package
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4
+        with:
+          subject-path: ${{ steps.archive.outputs.path }}
+
+      - name: Upload ZLMediaKit package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          path: ${{ steps.archive.outputs.path }}
+          archive: false
+          if-no-files-found: error

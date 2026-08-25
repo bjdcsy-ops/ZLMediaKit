@@ -1,94 +1,188 @@
 #!/usr/bin/env bash
-# Build ZLMediaKit for linux/arm64 inside a container or on a native arm64 host.
-set -euxo pipefail
 
-export DEBIAN_FRONTEND=noninteractive
+# Container-side Linux ARM64 build orchestrator.
 
-if command -v apt-get >/dev/null 2>&1; then
-  apt-get update
-  apt-get install -y --no-install-recommends \
-    git wget ca-certificates gcc g++ make perl python3 \
-    tar gzip xz-utils pkg-config zlib1g-dev
-elif command -v yum >/dev/null 2>&1; then
-  yum install -y git wget gcc gcc-c++ make perl python3 tar gzip which zlib-devel
+set -euo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPOSITORY_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
+LINUX_ARM64_DIR="$SCRIPT_DIR/linux-arm64"
+
+# shellcheck source=linux-arm64/dependencies.lock
+source "$LINUX_ARM64_DIR/dependencies.lock"
+
+# Consumed by the sourced build metadata helpers.
+# shellcheck disable=SC2034
+ZLM_REPOSITORY_ROOT=$REPOSITORY_ROOT
+# shellcheck disable=SC2034
+ZLM_LINUX_ARM64_DIR=$LINUX_ARM64_DIR
+# shellcheck disable=SC2034
+ZLM_BUILD_SCRIPT="$SCRIPT_DIR/build_linux_arm64.sh"
+# shellcheck source=linux-arm64/lib/build-metadata.sh
+source "$LINUX_ARM64_DIR/lib/build-metadata.sh"
+
+BUILD_ROOT="$REPOSITORY_ROOT/.build/linux-arm64"
+SOURCE_ROOT="$BUILD_ROOT/sources"
+INSTALL_ROOT="$BUILD_ROOT/install"
+ZLM_BUILD_DIR="$BUILD_ROOT/zlmediakit"
+CCACHE_DIR=${CCACHE_DIR:-$BUILD_ROOT/ccache}
+
+assert_linux_arm64() {
+  case "$(uname -s)/$(uname -m)" in
+    Linux/aarch64 | Linux/arm64)
+      ;;
+    *)
+      printf 'Unsupported build platform: %s/%s. Linux ARM64 is required.\n' \
+        "$(uname -s)" "$(uname -m)" >&2
+      exit 1
+      ;;
+  esac
+}
+
+metadata_matches() {
+  local metadata=$1
+  local fingerprint=$2
+  local input_hash=$3
+
+  [ -f "$metadata" ] &&
+    grep -Fqx "builder_fingerprint=$fingerprint" "$metadata" &&
+    grep -Fqx "dependency_input_hash=$input_hash" "$metadata" &&
+    grep -Fqx "libsrtp_sha=$LIBSRTP_SHA" "$metadata" &&
+    grep -Fqx "openssl_sha=$OPENSSL_SHA" "$metadata" &&
+    grep -Fqx "usrsctp_sha=$USRSCTP_SHA" "$metadata"
+}
+
+build_dependencies() {
+  local jobs=$1
+
+  rm -rf -- "$INSTALL_ROOT"
+  mkdir -p "$INSTALL_ROOT"
+
+  cd "$SOURCE_ROOT/openssl"
+  make distclean >/dev/null 2>&1 || true
+  ./config \
+    no-shared \
+    no-tests \
+    no-asm \
+    no-dso \
+    -fPIC \
+    --prefix="$INSTALL_ROOT"
+  make -j"$jobs"
+  make install_sw
+
+  rm -rf -- "$SOURCE_ROOT/usrsctp/.zlm-build"
+  cmake \
+    -S "$SOURCE_ROOT/usrsctp" \
+    -B "$SOURCE_ROOT/usrsctp/.zlm-build" \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX="$INSTALL_ROOT" \
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+    -Dsctp_build_programs=OFF \
+    -Dsctp_build_shared_lib=OFF \
+    -Dsctp_build_static_lib=ON
+  cmake --build "$SOURCE_ROOT/usrsctp/.zlm-build" --parallel "$jobs"
+  cmake --install "$SOURCE_ROOT/usrsctp/.zlm-build"
+
+  cd "$SOURCE_ROOT/libsrtp"
+  make distclean >/dev/null 2>&1 || true
+  CFLAGS="-fcommon -I$INSTALL_ROOT/include" \
+    LDFLAGS="-L$INSTALL_ROOT/lib" \
+    LIBS='-ldl -lpthread' \
+    ./configure \
+      --enable-openssl \
+      --with-openssl-dir="$INSTALL_ROOT" \
+      --prefix="$INSTALL_ROOT"
+  make -j"$jobs"
+  make install
+}
+
+assert_linux_arm64
+
+for source_dir in openssl usrsctp libsrtp; do
+  if [ ! -d "$SOURCE_ROOT/$source_dir/.git" ]; then
+    printf 'Dependency source is missing: %s\n' "$SOURCE_ROOT/$source_dir" >&2
+    printf 'Run ./build-linux-arm64.sh so sources are prepared first.\n' >&2
+    exit 1
+  fi
+done
+
+jobs=${BUILD_JOBS:-$(nproc)}
+source_sha=${SOURCE_SHA:-$(git -C "$REPOSITORY_ROOT" rev-parse HEAD)}
+source_state_sha=${SOURCE_STATE_SHA:-$source_sha}
+source_dirty=${SOURCE_DIRTY:-false}
+source_revision=${SOURCE_REVISION:-${source_sha:0:7}}
+export SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-$(
+  git -C "$REPOSITORY_ROOT" show -s --format=%ct "$source_sha"
+)}
+
+fingerprint=$(zlm_builder_fingerprint)
+input_hash=$(zlm_dependency_input_hash)
+dependency_metadata="$INSTALL_ROOT/.zlmediakit-build-metadata"
+
+if metadata_matches "$dependency_metadata" "$fingerprint" "$input_hash"; then
+  printf 'ZLMediaKit dependencies: cache hit\n'
 else
-  echo "Unsupported package manager" >&2
-  exit 1
+  printf 'ZLMediaKit dependencies: cache miss\n'
+  build_dependencies "$jobs"
+  {
+    printf 'builder_fingerprint=%s\n' "$fingerprint"
+    printf 'dependency_input_hash=%s\n' "$input_hash"
+    printf 'libsrtp_sha=%s\n' "$LIBSRTP_SHA"
+    printf 'openssl_sha=%s\n' "$OPENSSL_SHA"
+    printf 'usrsctp_sha=%s\n' "$USRSCTP_SHA"
+  } >"$dependency_metadata"
 fi
 
-ARCH="$(uname -m)"
-case "${ARCH}" in
-  aarch64|arm64) CMAKE_ARCH="aarch64" ;;
-  x86_64|amd64)  CMAKE_ARCH="x86_64" ;;
-  *) echo "Unsupported arch: ${ARCH}" >&2; exit 1 ;;
-esac
+export CCACHE_DIR
+export CCACHE_MAXSIZE=${CCACHE_MAXSIZE:-750M}
+mkdir -p "$CCACHE_DIR"
+ccache --set-config=max_size="$CCACHE_MAXSIZE"
+ccache --zero-stats >/dev/null
+trap 'ccache --show-stats || true' EXIT
 
-CMAKE_VER="3.29.5"
-CMAKE_DIR="/opt/cmake-${CMAKE_VER}-linux-${CMAKE_ARCH}"
-if [ ! -x "${CMAKE_DIR}/bin/cmake" ]; then
-  wget -q "https://github.com/Kitware/CMake/releases/download/v${CMAKE_VER}/cmake-${CMAKE_VER}-linux-${CMAKE_ARCH}.tar.gz" \
-    -O "/tmp/cmake.tar.gz"
-  tar -xzf /tmp/cmake.tar.gz -C /opt
-fi
-export PATH="${CMAKE_DIR}/bin:${PATH}"
-cmake --version
-gcc --version
-uname -a
+rm -rf -- "$ZLM_BUILD_DIR" "$REPOSITORY_ROOT/release/linux/Release"
+mkdir -p "$ZLM_BUILD_DIR"
 
-ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-cd "${ROOT_DIR}"
+export PKG_CONFIG_PATH="$INSTALL_ROOT/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+cmake \
+  -S "$REPOSITORY_ROOT" \
+  -B "$ZLM_BUILD_DIR" \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+  -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+  -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+  -DCMAKE_INSTALL_PREFIX="$INSTALL_ROOT" \
+  -DCMAKE_PREFIX_PATH="$INSTALL_ROOT" \
+  -DOPENSSL_ROOT_DIR="$INSTALL_ROOT" \
+  -DOPENSSL_USE_STATIC_LIBS=TRUE \
+  -DSRTP_PREFIX="$INSTALL_ROOT" \
+  -DENABLE_OPENSSL=ON \
+  -DENABLE_WEBRTC=ON \
+  -DENABLE_SCTP=ON \
+  -DENABLE_SRT=ON \
+  -DENABLE_TESTS=OFF
+cmake --build "$ZLM_BUILD_DIR" --parallel "$jobs"
 
-INSTALL_DIR="${ROOT_DIR}/thirdparty_install"
-mkdir -p "${INSTALL_DIR}"
+for feature in ENABLE_OPENSSL ENABLE_WEBRTC ENABLE_SCTP ENABLE_SRT; do
+  if ! grep -Fq -- "-D$feature" "$ZLM_BUILD_DIR/compile_commands.json"; then
+    printf 'Expected feature was not compiled: %s\n' "$feature" >&2
+    exit 1
+  fi
+done
 
-# OpenSSL (static, no-asm: its armv8 assembly is non-PIC and breaks .so linking;
-# no-dso: avoids requiring -ldl for the dlfcn engine)
-cd "${ROOT_DIR}/3rdpart/openssl"
-make distclean >/dev/null 2>&1 || true
-./config no-shared no-asm no-dso -fPIC --prefix="${INSTALL_DIR}"
-make -j"$(nproc)"
-make install_sw
-ls -la "${INSTALL_DIR}/lib" "${INSTALL_DIR}/include/openssl" || ls -la "${INSTALL_DIR}/lib64" || true
-
-export PKG_CONFIG_PATH="${INSTALL_DIR}/lib/pkgconfig:${INSTALL_DIR}/lib64/pkgconfig:${PKG_CONFIG_PATH:-}"
-export CPPFLAGS="-I${INSTALL_DIR}/include ${CPPFLAGS:-}"
-export LDFLAGS="-L${INSTALL_DIR}/lib -L${INSTALL_DIR}/lib64 ${LDFLAGS:-}"
-export LIBS="-ldl -lpthread ${LIBS:-}"
-
-# usrsctp
-cd "${ROOT_DIR}/3rdpart/usrsctp"
-rm -rf build
-mkdir -p build && cd build
-cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_POSITION_INDEPENDENT_CODE=ON ..
-make -j"$(nproc)"
-make install
-
-# libsrtp
-# GCC 10+ defaults to -fno-common and breaks libsrtp 2.3.0 tests
-# (multiple definition of `bit_string`). Same fix as project dockerfile:
-# always pass CFLAGS=-fcommon for configure/make/install.
-cd "${ROOT_DIR}/3rdpart/libsrtp"
-make distclean >/dev/null 2>&1 || true
-export CFLAGS="-fcommon ${CPPFLAGS:-}"
-export LDFLAGS="${LDFLAGS:-}"
-export LIBS="${LIBS:-}"
-./configure --enable-openssl --with-openssl-dir="${INSTALL_DIR}"
-make -j"$(nproc)"
-make install
-# Ensure headers/libs are visible to CMake
-ls -la /usr/local/lib/libsrtp* /usr/local/include/srtp* 2>/dev/null || true
-ls -la ./*.a ./include 2>/dev/null || true
-
-# ZLMediaKit
-cd "${ROOT_DIR}"
-rm -rf linux_build
-mkdir -p linux_build
-cd linux_build
-cmake .. \
-  -DOPENSSL_ROOT_DIR="${INSTALL_DIR}" \
-  -DCMAKE_BUILD_TYPE=Release
-make -j"$(nproc)"
-
-echo "Build finished. Artifacts under: ${ROOT_DIR}/release"
-ls -la "${ROOT_DIR}/release" || true
-find "${ROOT_DIR}/release" -type f | head -50
+export \
+  BUILD_ROOT \
+  INSTALL_ROOT \
+  LIBSRTP_SHA \
+  OPENSSL_SHA \
+  REPOSITORY_ROOT \
+  SOURCE_DATE_EPOCH \
+  ZLM_BUILD_DIR \
+  fingerprint \
+  input_hash \
+  source_dirty \
+  source_revision \
+  source_sha \
+  source_state_sha \
+  USRSCTP_SHA
+"$LINUX_ARM64_DIR/package-runtime.sh"

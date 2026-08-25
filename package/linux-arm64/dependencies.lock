@@ -1,0 +1,8 @@
+# Exact source commits used by the Linux ARM64 build.
+
+LIBSRTP_REPOSITORY=https://github.com/cisco/libsrtp.git
+LIBSRTP_SHA=d02d21111e379c297e93a9033d7b653135f732ee
+OPENSSL_REPOSITORY=https://github.com/openssl/openssl.git
+OPENSSL_SHA=1708e3e85b4a86bae26860aa5d2913fc8eff6086
+USRSCTP_REPOSITORY=https://github.com/sctplab/usrsctp.git
+USRSCTP_SHA=07f871bda23943c43c9e74cc54f25130459de830

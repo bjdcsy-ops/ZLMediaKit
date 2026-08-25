@@ -45,6 +45,10 @@
 /3rdpart/media-server/.idea/
 /3rdpart/media-server/.idea/
 /build/
+/.build/
+/artifact/
+/linux_build/
+/thirdparty_install/
 /3rdpart/media-server/.idea/
 /ios/
 /cmake-build-*
