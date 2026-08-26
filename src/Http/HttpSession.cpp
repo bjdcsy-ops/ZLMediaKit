@@ -633,10 +633,7 @@ void HttpSession::onHttpRequest_GET() {
 }
 
 static string dateStr() {
-    char buf[64];
-    time_t tt = time(NULL);
-    strftime(buf, sizeof buf, "%a, %b %d %Y %H:%M:%S GMT", gmtime(&tt));
-    return buf;
+    return HttpConst::formatHttpDate(time(nullptr));
 }
 
 class AsyncSenderData {

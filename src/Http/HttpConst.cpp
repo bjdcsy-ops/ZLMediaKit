@@ -8,7 +8,9 @@
  * may be found in the AUTHORS file in the root of the source tree.
  */
 
-#include <string.h>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include "HttpConst.h"
 #include "Common/Parser.h"
 #include "Util/onceToken.h"
@@ -17,6 +19,149 @@ using namespace std;
 using namespace toolkit;
 
 namespace mediakit{
+
+namespace {
+
+const char *kWeekdays[] = { "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
+const char *kMonths[] = { "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+
+int parseFixedDigits(const string &value, size_t offset, size_t count) {
+    int result = 0;
+    for (size_t index = 0; index < count; ++index) {
+        auto ch = value[offset + index];
+        if (ch < '0' || ch > '9') {
+            return -1;
+        }
+        result = result * 10 + ch - '0';
+    }
+    return result;
+}
+
+int findToken(const string &value, size_t offset, const char *const *tokens, size_t count) {
+    for (size_t index = 0; index < count; ++index) {
+        if (value.compare(offset, 3, tokens[index]) == 0) {
+            return static_cast<int>(index);
+        }
+    }
+    return -1;
+}
+
+bool isLeapYear(int year) {
+    return year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+}
+
+int daysInMonth(int year, int month) {
+    static const int days[] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    return month == 2 && isLeapYear(year) ? 29 : days[month - 1];
+}
+
+int64_t daysFromCivil(int year, unsigned month, unsigned day) {
+    year -= month <= 2;
+    const int era = (year >= 0 ? year : year - 399) / 400;
+    const unsigned year_of_era = static_cast<unsigned>(year - era * 400);
+    const unsigned adjusted_month = month > 2 ? month - 3 : month + 9;
+    const unsigned day_of_year = (153 * adjusted_month + 2) / 5 + day - 1;
+    const unsigned day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    return static_cast<int64_t>(era) * 146097 + day_of_era - 719468;
+}
+
+bool parseHttpDateFields(
+    const string &date, bool legacy_order, int &weekday, int &year, int &month, int &day,
+    int &hour, int &minute, int &second) {
+    if (date.size() != 29 || date[3] != ',' || date[4] != ' ' || date[11] != ' ' || date[16] != ' ' ||
+        date[19] != ':' || date[22] != ':' || date[25] != ' ' || date.compare(26, 3, "GMT") != 0) {
+        return false;
+    }
+
+    weekday = findToken(date, 0, kWeekdays, sizeof(kWeekdays) / sizeof(kWeekdays[0]));
+    if (legacy_order) {
+        if (date[8] != ' ') {
+            return false;
+        }
+        month = findToken(date, 5, kMonths, sizeof(kMonths) / sizeof(kMonths[0])) + 1;
+        day = parseFixedDigits(date, 9, 2);
+    } else {
+        if (date[7] != ' ') {
+            return false;
+        }
+        day = parseFixedDigits(date, 5, 2);
+        month = findToken(date, 8, kMonths, sizeof(kMonths) / sizeof(kMonths[0])) + 1;
+    }
+    year = parseFixedDigits(date, 12, 4);
+    hour = parseFixedDigits(date, 17, 2);
+    minute = parseFixedDigits(date, 20, 2);
+    second = parseFixedDigits(date, 23, 2);
+    return weekday >= 0 && year >= 1970 && month >= 1 && month <= 12 && day >= 1 &&
+           day <= daysInMonth(year, month) && hour >= 0 && hour <= 23 && minute >= 0 && minute <= 59 &&
+           second >= 0 && second <= 59;
+}
+
+bool parseDate(const string &date, time_t &timestamp, bool validate_weekday) {
+    int weekday;
+    int year;
+    int month;
+    int day;
+    int hour;
+    int minute;
+    int second;
+    if (!parseHttpDateFields(date, false, weekday, year, month, day, hour, minute, second) &&
+        !parseHttpDateFields(date, true, weekday, year, month, day, hour, minute, second)) {
+        return false;
+    }
+
+    auto days = daysFromCivil(year, static_cast<unsigned>(month), static_cast<unsigned>(day));
+    if (validate_weekday) {
+        auto expected_weekday = static_cast<int>((days + 4) % 7);
+        if (expected_weekday < 0) {
+            expected_weekday += 7;
+        }
+        if (weekday != expected_weekday) {
+            return false;
+        }
+    }
+
+    auto seconds = days * 24 * 60 * 60 + hour * 60 * 60 + minute * 60 + second;
+    auto converted = static_cast<time_t>(seconds);
+    if (static_cast<int64_t>(converted) != seconds) {
+        return false;
+    }
+    timestamp = converted;
+    return true;
+}
+
+} // namespace
+
+string HttpConst::formatHttpDate(time_t timestamp) {
+    struct tm utc_time = {};
+#if defined(_WIN32)
+    if (gmtime_s(&utc_time, &timestamp) != 0) {
+        return "";
+    }
+#else
+    if (!gmtime_r(&timestamp, &utc_time)) {
+        return "";
+    }
+#endif
+    auto year = utc_time.tm_year + 1900;
+    if (utc_time.tm_wday < 0 || utc_time.tm_wday > 6 || utc_time.tm_mon < 0 || utc_time.tm_mon > 11 ||
+        year < 0 || year > 9999) {
+        return "";
+    }
+
+    char buffer[32];
+    auto size = snprintf(
+        buffer, sizeof(buffer), "%s, %02d %s %04d %02d:%02d:%02d GMT", kWeekdays[utc_time.tm_wday],
+        utc_time.tm_mday, kMonths[utc_time.tm_mon], year, utc_time.tm_hour, utc_time.tm_min, utc_time.tm_sec);
+    return size == 29 ? string(buffer, static_cast<size_t>(size)) : "";
+}
+
+bool HttpConst::parseHttpDate(const string &date, time_t &timestamp) {
+    return parseDate(date, timestamp, true);
+}
+
+bool HttpConst::parseCookieDate(const string &date, time_t &timestamp) {
+    return parseDate(date, timestamp, false);
+}
 
 const char *HttpConst::getHttpStatusMessage(int status) {
     switch (status) {

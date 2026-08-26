@@ -440,7 +440,7 @@ bool HttpClient::isHttps() const {
 }
 
 void HttpClient::checkCookie(HttpClient::HttpHeader &headers) {
-    //Set-Cookie: IPTV_SERVER=8E03927B-CC8C-4389-BC00-31DBA7EC7B49;expires=Sun, Sep 23 2018 15:07:31 GMT;path=/index/api/
+    //Set-Cookie: IPTV_SERVER=8E03927B-CC8C-4389-BC00-31DBA7EC7B49;expires=Sun, 23 Sep 2018 15:07:31 GMT;path=/index/api/
     for (auto it_set_cookie = headers.find("Set-Cookie"); it_set_cookie != headers.end(); ++it_set_cookie) {
         auto key_val = Parser::parseArgs(it_set_cookie->second, ";", "=");
         HttpCookie::Ptr cookie = std::make_shared<HttpCookie>();

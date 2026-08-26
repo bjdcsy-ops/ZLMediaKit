@@ -55,3 +55,38 @@ python3 tests/test_rtsp_play_rtp_info.py \
 
 测试输出不会显示 URL 中的用户名和密码。任意会话中的轨道缺失或
 RTP-Info 不匹配都会使脚本以非零状态退出。
+
+## HTTP API 鉴权与 Cookie 回归测试
+
+`test_http_cookie` 检查服务端生成的 `Expires` 是否使用 IMF-fixdate，并验证
+标准日期、旧版 ZLMediaKit 日期和闰日解析：
+
+```bash
+./release/linux/Release/test_http_cookie
+```
+
+`test_http_api_auth.py` 连接正在运行的 MediaServer，检查以下行为：
+
+- GET、表单 POST 和 JSON POST 携带正确 `secret` 时不创建网页登录 Cookie；
+- 缺失或错误的 `secret` 返回并复用 `ZLM_UNLOGIN` challenge；
+- challenge 可以完成 digest 登录，并换取 `ZLM_LOGINED`；
+- 有效的登录 Cookie 可以独立完成 API 鉴权；
+- 登录与登出响应会分别删除旧 challenge 和登录 Cookie；
+- HTTP `Date` 与所有 Cookie 的 `Expires` 都使用 IMF-fixdate。
+
+脚本从环境变量读取 API secret，脚本自身不会把 secret 输出到测试结果。
+现有服务若启用了 `api.apiDebug`，MediaServer 仍会记录包含 API 参数的请求，
+应只在受控环境运行或先关闭该配置：
+
+```bash
+ZLM_API_SECRET='<secret>' \
+  python3 tests/test_http_api_auth.py http://127.0.0.1:80
+```
+
+也可以让脚本使用临时配置启动并停止待测二进制；此模式会自动生成测试
+secret，并关闭 HTTP 之外的监听端口：
+
+```bash
+python3 tests/test_http_api_auth.py \
+  --server artifact/zlmediakit-debian11-arm64/MediaServer
+```

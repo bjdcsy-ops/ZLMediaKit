@@ -16,6 +16,8 @@ if [ ! -f "$PACKAGE_DIR/BUILDINFO.txt" ]; then
   exit 1
 fi
 
+"$SCRIPT_DIR/tools/verify-artifact.sh" "$PACKAGE_DIR" >&2
+
 source_date_epoch=$(sed -n 's/^source_date_epoch=//p' \
   "$PACKAGE_DIR/BUILDINFO.txt")
 if ! grep -Eq '^[0-9]+$' <<<"$source_date_epoch"; then

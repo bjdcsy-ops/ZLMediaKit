@@ -70,11 +70,11 @@ public:
      * 获取http中Set-Cookie字段的值
      * @param cookie_name 该cookie的名称，譬如 MY_SESSION
      * @param path http访问路径
-     * @return 例如 MY_SESSION=XXXXXX;expires=Wed, Jun 12 2019 06:30:48 GMT;path=/index/files/
+     * @return 例如 MY_SESSION=XXXXXX;expires=Wed, 12 Jun 2019 06:30:48 GMT;path=/index/files/
      * Get the value of the Set-Cookie field in http
      * @param cookie_name the name of this cookie, such as MY_SESSION
      * @param path http access path
-     * @return For example, MY_SESSION=XXXXXX;expires=Wed, Jun 12 2019 06:30:48 GMT;path=/index/files/
+     * @return For example, MY_SESSION=XXXXXX;expires=Wed, 12 Jun 2019 06:30:48 GMT;path=/index/files/
      
      * [AUTO-TRANSLATED:8699036b]
      */

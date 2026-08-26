@@ -787,33 +787,25 @@ void check_secret(toolkit::SockInfo &sender, mediakit::HttpSession::KeyValue &he
         throw AuthException("Your ip is not allowed to access the service.");
     }
 
-    try {
-        auto logined_cookie = HttpCookieManager::Instance().getCookie(kLoginedCookieName, allArgs.getParser().getHeader());
-        if (!logined_cookie) {
-            auto unlogin_cookie = HttpCookieManager::Instance().getCookie(kUnLoginCookieName, allArgs.getParser().getHeader());
-            if (!unlogin_cookie) {
-                unlogin_cookie = HttpCookieManager::Instance().addCookie(kUnLoginCookieName, "", kUnLoginCookieLifeSeconds);
-                headerOut["Set-Cookie"] = unlogin_cookie->getCookie(kLoginCookiePath);
-            }
-            val["cookie"] = unlogin_cookie->getCookie();
-            throw AuthException("Please login first", headerOut, val);
-        }
+    auto logined_cookie = HttpCookieManager::Instance().getCookie(kLoginedCookieName, allArgs.getParser().getHeader());
+    if (logined_cookie) {
         // 优先cookie登陆鉴权
-    } catch (...) {
-        try {
-            // cookie登陆鉴权失败了再比对secret
-            CHECK_ARGS("secret");
-            if (api_secret != allArgs["secret"]) {
-                throw AuthException("Incorrect secret");
-            }
-            val.removeMember("cookie");
-            return;
-        } catch (...) {
-            // 未提供secret或secret不匹配，这个异常隐藏
-        }
-        // secret鉴权模式失败，抛出要求cookie登录的异常
-        throw;
+        return;
     }
+
+    auto request_secret = allArgs["secret"];
+    if (!request_secret.empty() && api_secret == request_secret) {
+        // secret鉴权成功时无需创建网页登录挑战cookie
+        return;
+    }
+
+    auto unlogin_cookie = HttpCookieManager::Instance().getCookie(kUnLoginCookieName, allArgs.getParser().getHeader());
+    if (!unlogin_cookie) {
+        unlogin_cookie = HttpCookieManager::Instance().addCookie(kUnLoginCookieName, "", kUnLoginCookieLifeSeconds);
+        headerOut["Set-Cookie"] = unlogin_cookie->getCookie(kLoginCookiePath);
+    }
+    val["cookie"] = unlogin_cookie->getCookie();
+    throw AuthException("Please login first", headerOut, val);
 }
 
 template void check_secret<ApiArgsType>(toolkit::SockInfo &, mediakit::HttpSession::KeyValue &, const HttpAllArgs<ApiArgsType> &, Json::Value &);
@@ -2556,7 +2548,7 @@ void installWebApi() {
         auto unlogin_cookie = HttpCookieManager::Instance().getCookie(kUnLoginCookieName, allArgs.getParser().getHeader());
         if (!unlogin_cookie) {
             unlogin_cookie = HttpCookieManager::Instance().addCookie(kUnLoginCookieName, "", kUnLoginCookieLifeSeconds);
-            headerOut["Set-Cookie"] = unlogin_cookie->getCookie(kLoginCookiePath);
+            headerOut.emplace_force("Set-Cookie", unlogin_cookie->getCookie(kLoginCookiePath));
         }
         val["cookie"] = unlogin_cookie->getCookie();
     });

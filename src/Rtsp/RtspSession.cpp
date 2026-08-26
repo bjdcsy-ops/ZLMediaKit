@@ -11,6 +11,7 @@
 #include <atomic>
 #include <iomanip>
 #include "Common/config.h"
+#include "Http/HttpConst.h"
 #include "UDPServer.h"
 #include "RtspSession.h"
 #include "Util/MD5.h"
@@ -1153,10 +1154,7 @@ void RtspSession::startListenPeerUdpData(int track_idx) {
 }
 
 static string dateStr(){
-    char buf[64];
-    time_t tt = time(NULL);
-    strftime(buf, sizeof buf, "%a, %b %d %Y %H:%M:%S GMT", gmtime(&tt));
-    return buf;
+    return HttpConst::formatHttpDate(time(nullptr));
 }
 
 bool RtspSession::sendRtspResponse(const string &res_code, const StrCaseMap &header_const, const string &sdp, const char *protocol){

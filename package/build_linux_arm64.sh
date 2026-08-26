@@ -170,6 +170,17 @@ for feature in ENABLE_OPENSSL ENABLE_WEBRTC ENABLE_SCTP ENABLE_SRT; do
   fi
 done
 
+test_status=0
+cmake -S "$REPOSITORY_ROOT" -B "$ZLM_BUILD_DIR" -DENABLE_TESTS=ON
+cmake --build "$ZLM_BUILD_DIR" --target test_http_cookie --parallel "$jobs" || test_status=$?
+if [ "$test_status" -eq 0 ]; then
+  "$REPOSITORY_ROOT/release/linux/Release/test_http_cookie" || test_status=$?
+fi
+cmake -S "$REPOSITORY_ROOT" -B "$ZLM_BUILD_DIR" -DENABLE_TESTS=OFF
+if [ "$test_status" -ne 0 ]; then
+  exit "$test_status"
+fi
+
 export \
   BUILD_ROOT \
   INSTALL_ROOT \

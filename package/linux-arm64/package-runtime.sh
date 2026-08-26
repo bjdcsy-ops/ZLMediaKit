@@ -24,9 +24,21 @@ export LC_ALL=C
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 ARTIFACT_NAME=zlmediakit-debian11-arm64
-PACKAGE_DIR="$REPOSITORY_ROOT/artifact/$ARTIFACT_NAME"
+FINAL_PACKAGE_DIR="$REPOSITORY_ROOT/artifact/$ARTIFACT_NAME"
+PACKAGE_STAGING_DIR="$FINAL_PACKAGE_DIR.staging"
+PACKAGE_DIR=$PACKAGE_STAGING_DIR
 PACKAGE_MANIFEST="$PACKAGE_DIR/MANIFEST.mtree"
 RELEASE_DIR="$REPOSITORY_ROOT/release/linux/Release"
+manifest_tmp=
+
+cleanup_staging() {
+  rm -rf -- "$PACKAGE_STAGING_DIR"
+  if [ -n "$manifest_tmp" ]; then
+    rm -f -- "$manifest_tmp"
+  fi
+}
+
+trap cleanup_staging EXIT
 
 verify_arm64_binary() {
   local binary=$1
@@ -86,7 +98,7 @@ for required_path in \
   fi
 done
 
-rm -rf -- "$PACKAGE_DIR"
+rm -rf -- "$PACKAGE_STAGING_DIR"
 mkdir -p "$PACKAGE_DIR/www"
 install -m 0755 "$RELEASE_DIR/MediaServer" "$PACKAGE_DIR/MediaServer"
 install -m 0755 "$RELEASE_DIR/libmk_api.so" "$PACKAGE_DIR/libmk_api.so"
@@ -105,6 +117,8 @@ build_script_sha=$(sha256sum "$REPOSITORY_ROOT/package/build_linux_arm64.sh" |
   awk '{ print $1 }')
 package_script_sha=$(sha256sum "$SCRIPT_DIR/package-runtime.sh" |
   awk '{ print $1 }')
+http_api_auth_test_sha=$(sha256sum \
+  "$REPOSITORY_ROOT/tests/test_http_api_auth.py" | awk '{ print $1 }')
 source_date_utc=$(date --utc --date="@$SOURCE_DATE_EPOCH" +%Y-%m-%dT%H:%M:%SZ)
 glibc_version=$(getconf GNU_LIBC_VERSION | awk '{ print $2 }')
 
@@ -137,6 +151,9 @@ glibc_version=$(getconf GNU_LIBC_VERSION | awk '{ print $2 }')
   printf 'enable_sctp=true\n'
   printf 'enable_srt=true\n'
   printf 'enable_tests=false\n'
+  printf 'http_cookie_regression_test=true\n'
+  printf 'http_api_auth_smoke=true\n'
+  printf 'http_api_auth_test_sha256=%s\n' "$http_api_auth_test_sha"
 } >"$PACKAGE_DIR/BUILDINFO.txt"
 
 cat >"$PACKAGE_DIR/README.txt" <<'EOF'
@@ -177,13 +194,20 @@ if ! grep -Fq "${source_sha:0:7}" <<<"$version_output"; then
 fi
 
 manifest_tmp=$(mktemp "$BUILD_ROOT/.artifact-manifest.XXXXXX")
-trap 'rm -f -- "$manifest_tmp"' EXIT
 generate_manifest "$manifest_tmp"
 chmod 0644 "$manifest_tmp"
 mv -- "$manifest_tmp" "$PACKAGE_MANIFEST"
-trap - EXIT
+manifest_tmp=
+
+python3 "$REPOSITORY_ROOT/tests/test_http_api_auth.py" \
+  --server "$PACKAGE_DIR/MediaServer" \
+  --config "$PACKAGE_DIR/config.ini" \
+  --certificate "$PACKAGE_DIR/default.pem"
 
 "$SCRIPT_DIR/tools/verify-artifact.sh" "$PACKAGE_DIR"
 
-printf 'Build completed: %s\n' "$PACKAGE_DIR"
-printf 'Artifact manifest: %s\n' "$PACKAGE_MANIFEST"
+rm -rf -- "$FINAL_PACKAGE_DIR"
+mv -- "$PACKAGE_STAGING_DIR" "$FINAL_PACKAGE_DIR"
+
+printf 'Build completed: %s\n' "$FINAL_PACKAGE_DIR"
+printf 'Artifact manifest: %s\n' "$FINAL_PACKAGE_DIR/MANIFEST.mtree"

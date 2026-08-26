@@ -11,6 +11,7 @@
 #ifndef ZLMEDIAKIT_HTTPCONST_H
 #define ZLMEDIAKIT_HTTPCONST_H
 
+#include <ctime>
 #include <string>
 
 namespace mediakit{
@@ -44,6 +45,29 @@ public:
      * [AUTO-TRANSLATED:03d63e1f]
      */
     static const std::string &getHttpContentType(const char *name);
+
+    /**
+     * Format a timestamp as IMF-fixdate in UTC.
+     * @param timestamp Unix timestamp in seconds
+     * @return HTTP date, or an empty string when conversion fails
+     */
+    static std::string formatHttpDate(time_t timestamp);
+
+    /**
+     * Parse IMF-fixdate or the legacy ZLMediaKit day/month ordering.
+     * @param date HTTP date
+     * @param timestamp Parsed Unix timestamp in seconds
+     * @return Whether the complete date is valid
+     */
+    static bool parseHttpDate(const std::string &date, time_t &timestamp);
+
+    /**
+     * Parse a cookie expiry date while tolerating a mismatched weekday token.
+     * @param date Cookie expiry date in IMF-fixdate or legacy ZLMediaKit order
+     * @param timestamp Parsed Unix timestamp in seconds
+     * @return Whether the complete calendar date and time are valid
+     */
+    static bool parseCookieDate(const std::string &date, time_t &timestamp);
 };
 
 }//mediakit

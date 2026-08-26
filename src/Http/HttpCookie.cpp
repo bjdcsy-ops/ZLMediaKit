@@ -8,15 +8,10 @@
  * may be found in the AUTHORS file in the root of the source tree.
  */
 
+#include <cstdint>
 #include "HttpCookie.h"
-#include "Util/util.h"
-#include "Util/onceToken.h"
+#include "HttpConst.h"
 
-#if defined(_WIN32)
-#include "Util/strptime_win.h"
-#endif
-
-using namespace toolkit;
 using namespace std;
 
 namespace mediakit {
@@ -29,40 +24,20 @@ void HttpCookie::setHost(const string &host) {
     _host = host;
 }
 
-// from https://gmbabar.wordpress.com/2010/12/01/mktime-slow-use-custom-function/#comment-58
-static time_t time_to_epoch(const struct tm *ltm, int utcdiff) {
-    const int mon_days[] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
-    long tyears, tdays, leaps, utc_hrs;
-    int i;
-
-    tyears = ltm->tm_year - 70; // tm->tm_year is from 1900.
-    leaps = (tyears + 2) / 4; // no of next two lines until year 2100.
-    // i = (ltm->tm_year – 100) / 100;  [AUTO-TRANSLATED:12beea30]
-    // i = (ltm->tm_year – 100) / 100;
-    // leaps -= ( (i/4)*3 + i%4 );
-    tdays = 0;
-    for (i = 0; i < ltm->tm_mon; i++)
-        tdays += mon_days[i];
-
-    tdays += ltm->tm_mday - 1; // days of month passed.
-    tdays = tdays + (tyears * 365) + leaps;
-
-    utc_hrs = ltm->tm_hour + utcdiff; // for your time zone.
-    return (tdays * 86400) + (utc_hrs * 3600) + (ltm->tm_min * 60) + ltm->tm_sec;
-}
-
-static time_t timeStrToInt(const string &date) {
-    struct tm tt;
-    strptime(date.data(), "%a, %b %d %Y %H:%M:%S %Z", &tt);
-    // mktime内部有使用互斥锁，非常影响性能  [AUTO-TRANSLATED:b3270635]
-    // mktime uses mutex internally, which significantly affects performance
-    return time_to_epoch(&tt, getGMTOff() / 3600); // mktime(&tt);
-}
-
 void HttpCookie::setExpires(const string &expires, const string &server_date) {
-    _expire = timeStrToInt(expires);
-    if (!server_date.empty()) {
-        _expire = time(NULL) + (_expire - timeStrToInt(server_date));
+    time_t expires_at;
+    if (!HttpConst::parseCookieDate(expires, expires_at)) {
+        _expire = 0;
+        return;
+    }
+
+    _expire = expires_at;
+    time_t server_at;
+    if (!server_date.empty() && HttpConst::parseHttpDate(server_date, server_at)) {
+        auto adjusted = static_cast<int64_t>(time(nullptr)) + static_cast<int64_t>(expires_at) -
+                        static_cast<int64_t>(server_at);
+        auto converted = static_cast<time_t>(adjusted);
+        _expire = static_cast<int64_t>(converted) == adjusted ? converted : 0;
     }
 }
 
