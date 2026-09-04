@@ -87,6 +87,10 @@ bool RtspMuxer::addTrack(const Track::Ptr &track) {
     if (!encoder) {
         return false;
     }
+    if (track->getTrackType() == TrackAudio) {
+        auto &audio = static_cast<const AudioTrack &>(*track);
+        encoder->setAudioInfo(audio.getAudioSampleRate(), audio.getAudioChannel());
+    }
 
     // 标记已经存在该类型track  [AUTO-TRANSLATED:ed79ebb5]
     // Mark that a track of this type already exists

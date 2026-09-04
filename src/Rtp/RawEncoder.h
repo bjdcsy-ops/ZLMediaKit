@@ -46,6 +46,7 @@ public:
      * [AUTO-TRANSLATED:d13bc7f2]
      */
     bool inputFrame(const Frame::Ptr &frame) override;
+    void flush() override;
 
 protected:
     // rtp打包后回调  [AUTO-TRANSLATED:61f5159b]

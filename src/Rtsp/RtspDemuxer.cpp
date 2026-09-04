@@ -104,6 +104,7 @@ void RtspDemuxer::makeAudioTrack(const SdpTrack::Ptr &audio) {
     }
     // 设置rtp解码器代理，生成的frame写入该Track  [AUTO-TRANSLATED:b2a2362e]
     // Set the rtp decoder proxy, the generated frame is written to this Track
+    _audio_rtp_decoder->setAudioInfo(_audio_track->getAudioSampleRate(), _audio_track->getAudioChannel());
     _audio_rtp_decoder->addDelegate(_audio_track);
     addTrack(_audio_track);
 }

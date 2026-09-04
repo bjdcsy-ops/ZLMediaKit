@@ -79,10 +79,13 @@ public:
     // 返回rtp负载最大长度  [AUTO-TRANSLATED:0a8ee7d9]
     // Return the maximum length of the RTP payload
     size_t getMaxSize() const {
-        return _mtu_size - RtpPacket::kRtpHeaderSize;
+        return _mtu_size > RtpPacket::kRtpHeaderSize ? _mtu_size - RtpPacket::kRtpHeaderSize : 0;
     }
 
     RtpPacket::Ptr makeRtp(TrackType type,const void *data, size_t len, bool mark, uint64_t stamp);
+    // Audio packet boundaries need sample precision, independently of millisecond Frame timestamps.
+    RtpPacket::Ptr makeRtpWithStamp(TrackType type, const void *data, size_t len, bool mark,
+                                   uint64_t stamp_ms, uint32_t rtp_stamp);
 
 private:
     uint8_t _pt;
@@ -103,6 +106,9 @@ public:
     }
 
     RtpInfo &getRtpInfo() { return *_rtp_info; }
+
+    // Optional codec initialization; codecs without sample-based packetization keep their existing behavior.
+    virtual void setAudioInfo(int sample_rate, int channels) {}
 
     enum {
         RTP_ENCODER_PKT_DUR_MS = 1 // 主要应用于g711 rtp 打包器每个包的时间长度，option_value 为int*, option_len 为4

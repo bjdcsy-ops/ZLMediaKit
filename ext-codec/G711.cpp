@@ -14,28 +14,46 @@
 #include "Extension/CommonRtp.h"
 #include "Extension/CommonRtmp.h"
 #include "riff-acm.h"
+#include <limits>
+#include <stdexcept>
 using namespace std;
 using namespace toolkit;
 
 namespace mediakit {
+
+G711Track::G711Track(CodecId codec, int sample_rate, int channels, int sample_bit)
+    : AudioTrackImp(codec, sample_rate ? sample_rate : 8000, channels ? channels : 1, 16) {
+    if ((codec != CodecG711A && codec != CodecG711U) || _sample_rate <= 0 || _channels <= 0
+        || _channels > std::numeric_limits<uint16_t>::max()
+        || uint64_t(_sample_rate) * _channels > std::numeric_limits<uint32_t>::max()) {
+        throw std::invalid_argument("Invalid G711 audio parameters");
+    }
+}
 
 Buffer::Ptr G711Track::getExtraData() const {
     struct wave_format_t wav {};
     wav.wFormatTag = getCodecId() == CodecG711A ? WAVE_FORMAT_ALAW : WAVE_FORMAT_MULAW;
     wav.nChannels = getAudioChannel();
     wav.nSamplesPerSec = getAudioSampleRate();
-    wav.nAvgBytesPerSec = 8000;
-    wav.nBlockAlign = 1;
+    wav.nAvgBytesPerSec = uint64_t(getAudioSampleRate()) * getAudioChannel();
+    wav.nBlockAlign = getAudioChannel();
     wav.wBitsPerSample = 8;
     auto buff = BufferRaw::create(18 + wav.cbSize);
-    wave_format_save(&wav, (uint8_t*)buff->data(), buff->size());
+    auto bytes = wave_format_save(&wav, (uint8_t*)buff->data(), buff->getCapacity());
+    if (bytes <= 0) {
+        return nullptr;
+    }
+    buff->setSize(bytes);
     return buff;
 }
 
 void G711Track::setExtraData(const uint8_t *data, size_t size) {
-    struct wave_format_t wav;
-    if (wave_format_load(data, size, &wav) > 0) {
-        // Successfully parsed Opus header
+    struct wave_format_t wav {};
+    if (wave_format_load(data, size, &wav) > 0
+        && (wav.wFormatTag == WAVE_FORMAT_ALAW || wav.wFormatTag == WAVE_FORMAT_MULAW)
+        && wav.nSamplesPerSec > 0 && wav.nSamplesPerSec <= std::numeric_limits<int>::max()
+        && wav.nChannels > 0 && wav.wBitsPerSample == 8
+        && uint64_t(wav.nSamplesPerSec) * wav.nChannels <= std::numeric_limits<uint32_t>::max()) {
         _sample_rate = wav.nSamplesPerSec;
         _channels = wav.nChannels;
         _codecid = (wav.wFormatTag == WAVE_FORMAT_ALAW) ? CodecG711A : CodecG711U;
@@ -55,7 +73,7 @@ CodecId getCodecU() {
 }
 
 Track::Ptr getTrackByCodecId_l(CodecId codec, int sample_rate, int channels, int sample_bit) {
-    return std::make_shared<G711Track>(codec, sample_rate, 1, 16);
+    return std::make_shared<G711Track>(codec, sample_rate, channels, sample_bit);
 }
 
 Track::Ptr getTrackByCodecIdA(int sample_rate, int channels, int sample_bit) {
@@ -67,6 +85,12 @@ Track::Ptr getTrackByCodecIdU(int sample_rate, int channels, int sample_bit) {
 }
 
 Track::Ptr getTrackBySdp_l(CodecId codec, const SdpTrack::Ptr &track) {
+    if (track->_samplerate <= 0 || track->_channel <= 0
+        || track->_channel > std::numeric_limits<uint16_t>::max()
+        || uint64_t(track->_samplerate) * track->_channel > std::numeric_limits<uint32_t>::max()) {
+        WarnL << "Invalid G711 SDP audio parameters";
+        return nullptr;
+    }
     return std::make_shared<G711Track>(codec, track->_samplerate, track->_channel, 16);
 }
 
@@ -79,10 +103,7 @@ Track::Ptr getTrackBySdpU(const SdpTrack::Ptr &track) {
 }
 
 RtpCodec::Ptr getRtpEncoderByCodecId_l(CodecId codec, uint8_t pt) {
-    if (pt == Rtsp::PT_PCMA || pt == Rtsp::PT_PCMU) {
-        return std::make_shared<G711RtpEncoder>(8000, 1);
-    }
-    return std::make_shared<CommonRtpEncoder>();
+    return std::make_shared<G711RtpEncoder>();
 }
 
 RtpCodec::Ptr getRtpEncoderByCodecIdA(uint8_t pt) {
@@ -94,7 +115,7 @@ RtpCodec::Ptr getRtpEncoderByCodecIdU(uint8_t pt) {
 }
 
 RtpCodec::Ptr getRtpDecoderByCodecId_l(CodecId codec) {
-    return std::make_shared<CommonRtpDecoder>(codec);
+    return std::make_shared<G711RtpDecoder>(codec);
 }
 
 RtpCodec::Ptr getRtpDecoderByCodecIdA() {
@@ -157,5 +178,3 @@ CodecPlugin g711u_plugin = { getCodecU,
                              getFrameFromPtrU };
 
 }//namespace mediakit
-
-

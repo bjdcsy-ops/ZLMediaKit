@@ -22,7 +22,8 @@ namespace mediakit{
 class G711Track : public AudioTrackImp{
 public:
     using Ptr = std::shared_ptr<G711Track>;
-    G711Track(CodecId codecId, int sample_rate, int channels, int sample_bit) : AudioTrackImp(codecId, 8000, 1, 16) {}
+    // G711 has one encoded byte per channel/sample; sample_bit describes decoded PCM (16 bits).
+    G711Track(CodecId codecId, int sample_rate, int channels, int sample_bit);
 
     toolkit::Buffer::Ptr getExtraData() const override;
     void setExtraData(const uint8_t *data, size_t size) override;

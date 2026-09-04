@@ -44,7 +44,13 @@ private:
     void flushData();
 
 private:
-    uint64_t _last_dts = 0;
+    bool _have_packet = false;
+    bool _drop_fragment = false;
+    uint16_t _last_seq = 0;
+    uint32_t _last_rtp_stamp = 0;
+    uint32_t _last_ssrc = 0;
+    size_t _fragment_size = 0;
+    uint8_t _fragment_index = 0;
     FrameImp::Ptr _frame;
 };
 

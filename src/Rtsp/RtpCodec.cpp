@@ -13,6 +13,11 @@
 namespace mediakit{
 
 RtpPacket::Ptr RtpInfo::makeRtp(TrackType type, const void* data, size_t len, bool mark, uint64_t stamp) {
+    return makeRtpWithStamp(type, data, len, mark, stamp, uint64_t(stamp) * _sample_rate / 1000);
+}
+
+RtpPacket::Ptr RtpInfo::makeRtpWithStamp(TrackType type, const void *data, size_t len, bool mark,
+                                       uint64_t stamp, uint32_t rtp_stamp) {
     uint16_t payload_len = (uint16_t) (len + RtpPacket::kRtpHeaderSize);
     auto rtp = RtpPacket::create();
     rtp->setCapacity(payload_len + RtpPacket::kRtpTcpHeaderSize);
@@ -40,7 +45,7 @@ RtpPacket::Ptr RtpInfo::makeRtp(TrackType type, const void* data, size_t len, bo
     header->pt = _pt;
     header->seq = htons(_seq);
     ++_seq;
-    header->stamp = htonl(uint64_t(stamp) * _sample_rate / 1000);
+    header->stamp = htonl(rtp_stamp);
     header->ssrc = htonl(_ssrc);
     rtp->ntp_stamp = stamp;
     // 有效负载  [AUTO-TRANSLATED:8530a274]
@@ -52,5 +57,4 @@ RtpPacket::Ptr RtpInfo::makeRtp(TrackType type, const void* data, size_t len, bo
 }
 
 }//namespace mediakit
-
 

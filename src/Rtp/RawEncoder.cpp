@@ -30,6 +30,15 @@ RawEncoderImp::~RawEncoderImp() {
 
 bool RawEncoderImp::addTrack(const Track::Ptr &track) {
     if (_send_audio && track->getTrackType() == TrackType::TrackAudio && !_rtp_encoder) { // audio
+        if (_payload_type == Rtsp::PT_PCMU || _payload_type == Rtsp::PT_PCMA) {
+            auto &audio = static_cast<const AudioTrack &>(*track);
+            auto expected_codec = _payload_type == Rtsp::PT_PCMU ? CodecG711U : CodecG711A;
+            if (track->getCodecId() != expected_codec || audio.getAudioSampleRate() != 8000 || audio.getAudioChannel() != 1) {
+                WarnL << "Reject raw RTP static G711 PT " << int(_payload_type) << " for "
+                      << track->getCodecName() << "/" << audio.getAudioSampleRate() << "/" << audio.getAudioChannel();
+                return false;
+            }
+        }
         _rtp_encoder = createRtpEncoder(track);
         auto ring = std::make_shared<RtpRing::RingType>();
         ring->setDelegate(std::make_shared<RingDelegateHelper>([this](RtpPacket::Ptr rtp, bool is_key) { onRTP(std::move(rtp), true); }));
@@ -57,6 +66,12 @@ void RawEncoderImp::resetTracks() {
     return;
 }
 
+void RawEncoderImp::flush() {
+    if (_rtp_encoder) {
+        _rtp_encoder->flush();
+    }
+}
+
 bool RawEncoderImp::inputFrame(const Frame::Ptr &frame) {
     if (frame->getTrackType() == TrackType::TrackAudio && _send_audio && _rtp_encoder) {
         _rtp_encoder->inputFrame(frame);
@@ -78,6 +93,10 @@ RtpCodec::Ptr RawEncoderImp::createRtpEncoder(const Track::Ptr &track) {
         sample_rate = std::static_pointer_cast<AudioTrack>(track)->getAudioSampleRate();
     }
     auto ret = Factory::getRtpEncoderByCodecId(track->getCodecId(), _payload_type);
+    if (track->getTrackType() == TrackType::TrackAudio) {
+        auto &audio = static_cast<const AudioTrack &>(*track);
+        ret->setAudioInfo(audio.getAudioSampleRate(), audio.getAudioChannel());
+    }
     ret->setRtpInfo(_ssrc, mtu, sample_rate, _payload_type);
     return ret;
 }
