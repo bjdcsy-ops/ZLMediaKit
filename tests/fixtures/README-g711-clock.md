@@ -33,6 +33,7 @@ clock policy of other codecs or override an explicit `FrameStamp` timestamp.
 | Larger cumulative phase error, sequence gap, or changed SSRC | Preserve an explicit discontinuity; sequence gaps remain boundaries even if their raw phase error is small |
 | Duplicate or known historical packet | Discard without emitting duplicate samples; compare exact sequence/timestamp/payload-size metadata from the latest 100 accepted packets |
 | Unrecognized same-SSRC sequence restart | Hold at most one abnormal probation packet; the next consecutive sequence confirms the restart if its timestamp error relative to the first packet's end is within the sum of both packets' phase bounds, then release both in order |
+| Positive sequence gap with a backwards RTP clock beyond the phase bound | Use the same restart probation and NTP reanchor; a reset such as `60000 -> 1000` must not add the old/new raw RTP clock difference to the output sample axis |
 | Lone abnormal late packet followed by normal input | Discard the probation packet and resume normal immediate output |
 | SR/NTP observation error within 1 ms | Keep the existing clock anchor |
 | Other small SR/NTP error | Slew the NTP clock by at most 1 ms per second; preserve exact RTP sample progression |
@@ -51,6 +52,13 @@ timestamps can therefore still confirm a restart when sequence numbers are
 consecutive. The normal per-packet correction bound is unchanged after release;
 a larger offset relative to the first packet's anchor remains an explicit
 discontinuity rather than silently dropping the restarted audio.
+
+The signed 16-bit sequence difference alone does not identify a restart.
+For a positive sequence gap, a backwards sample-clock error beyond the phase
+bound also enters probation. Normal sequence/RTP wrap and forward-time packet
+loss retain their raw RTP duration; bounded phase errors keep the existing gap
+boundary behavior. A lone candidate is discarded when normal old-stream input
+resumes, and duplicate or nonconsecutive candidates cannot confirm a restart.
 
 A complete sequence with a small permanent phase offset is indistinguishable
 from a long bounded timestamp excursion. A pause within the same amplitude
@@ -75,6 +83,7 @@ guessed number of consecutive packets.
 | Captured input | 749 RTP packets and 6 SR anchors through `RtpTrackImp`, with synthetic payload bytes |
 | Sequence boundaries | Loss, duplicates, late packets, consecutive historical packets with variable payload lengths, SSRC restart, sequence and RTP timestamp wrap |
 | Same-SSRC restart with bounded timestamp phase | Real `RtpTrackImp` sequence reset at 16/32 kHz, mono/stereo and PCMA/PCMU; probation release, byte conservation and sustained output; pair-boundary acceptance and out-of-bound rejection |
+| Same-SSRC backwards clock across the sequence half-range | Real `RtpTrackImp` with an epoch NTP anchor, `20000/33768/33769/60000 -> 1000`, mono/stereo and PCMA/PCMU; sample/RTP reanchor, bounded phase, forward-loss preservation and probation guards |
 | Correction limits | 3/4/5/25/250-packet holds, permanent bounded phase and direct sign changes, cumulative drift beyond the magnitude bound, variable packet thresholds, sequence gaps, large jumps, bounded clock slew and persistent large SR correction |
 | Compatibility | Existing SDP/static and dynamic PT, WAVE metadata, generic Frame packetization, cache wrappers and timestamp overrides |
 

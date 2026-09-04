@@ -58,7 +58,11 @@ bool G711RtpDecoder::inputRtp(const RtpPacket::Ptr &rtp, bool) {
     auto raw_delta = int64_t(int32_t(raw_stamp - _expected_raw_stamp));
     bool restart = _restart_confirmed || (_have_clock && ssrc != _ssrc);
     _restart_confirmed = false;
-    if (_have_clock && !restart && seq_delta <= 0) {
+    // A reset such as 60000 -> 1000 has a positive signed sequence delta.
+    // Forward packet loss cannot explain a backwards sample clock beyond the
+    // phase bound; confirm that case before applying its old/new RTP offset.
+    const auto backward_clock_gap = seq_delta > 1 && raw_delta < -int64_t(bounce_limit);
+    if (_have_clock && !restart && (seq_delta <= 0 || backward_clock_gap)) {
         // Normal input is already RTP-sorted. Reject duplicate/late packets,
         // but confirm a same-SSRC sequence restart after two progressing packets
         // rather than rejecting a rebooted sender forever. Only this abnormal

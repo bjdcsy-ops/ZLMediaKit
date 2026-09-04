@@ -545,6 +545,96 @@ void testReceiverSameSsrcRestartWithBoundedPhase(int rate, int channels, const s
     }
 }
 
+void testReceiverSameSsrcBackwardClockRestart(uint16_t previous_seq, int rate, int channels) {
+    for (auto codec : { CodecG711A, CodecG711U }) {
+        G711Pipeline pipeline(rate, channels, codec);
+        RtpTrackImp receiver;
+        constexpr uint64_t first_ntp_ms = 1700000000000ULL;
+        constexpr uint32_t old_raw_stamp = 500000000;
+        const auto samples = uint32_t(rate * 40 / 1000);
+        const auto bytes = samples * channels;
+        receiver.setNtpStamp(old_raw_stamp, first_ntp_ms);
+        std::vector<size_t> decoded_counts;
+        receiver.setOnSorted([&](RtpPacket::Ptr packet) {
+            pipeline.decoder->inputRtp(packet, false);
+            decoded_counts.emplace_back(pipeline.frames.size());
+        });
+        auto input = [&](uint16_t seq, uint32_t raw_stamp) {
+            auto packet = pipeline.packet(seq, raw_stamp, 0, bytes, pipeline.expected.size());
+            pipeline.expected.append(reinterpret_cast<const char *>(packet->getPayload()), bytes);
+            receiver.inputRtp(TrackAudio, rate,
+                reinterpret_cast<uint8_t *>(packet->data()) + RtpPacket::kRtpTcpHeaderSize,
+                packet->size() - RtpPacket::kRtpTcpHeaderSize);
+        };
+        input(previous_seq, old_raw_stamp);
+        constexpr unsigned restart_packets = 300;
+        for (unsigned i = 0; i < restart_packets; ++i) {
+            const int phase_ms = i % 3 == 1 ? 10 : i % 3 == 2 ? -10 : 0;
+            input(static_cast<uint16_t>(1000 + i), uint32_t((5000 + i * 40 + phase_ms) * (rate / 1000)));
+        }
+        receiver.flush();
+        pipeline.encoder.flush();
+        require(decoded_counts.size() == restart_packets + 1 && pipeline.frames.size() == decoded_counts.size(),
+                "same-SSRC backward-clock restart lost sorted packets or decoded samples");
+        const auto start = first_ntp_ms * rate / 1000;
+        require(exactFrame(pipeline.frames[1]).sample_stamp == start,
+                "same-SSRC restart copied the old raw RTP clock difference into the output sample clock");
+        require(decoded_counts[0] == 1 && decoded_counts[1] == 1,
+                "backward-clock restart bypassed the one-packet probation");
+        for (size_t i = 1; i < pipeline.frames.size(); ++i) {
+            const auto &exact = exactFrame(pipeline.frames[i]);
+            require(exact.discontinuity == (i == 1) && exact.sample_stamp == start + (i - 1) * samples,
+                    "backward-clock restart did not continue from its NTP sample anchor");
+            require(i == 1 || decoded_counts[i] == i + 1,
+                    "backward-clock restart did not release its probation packet promptly");
+        }
+        pipeline.captured.checkPayload(pipeline.expected, channels);
+        size_t emitted_bytes = 0;
+        for (const auto &packet : pipeline.captured.packets) {
+            const auto segment_bytes = emitted_bytes < bytes ? emitted_bytes : emitted_bytes - bytes;
+            require(packet->getStamp() == uint32_t(start + segment_bytes / channels),
+                    "repacketized RTP retained the sender's pre-restart clock offset");
+            require(emitted_bytes >= bytes || emitted_bytes + packet->getPayloadSize() <= bytes,
+                    "repacketization merged samples across the restart boundary");
+            emitted_bytes += packet->getPayloadSize();
+        }
+    }
+}
+
+void testForwardSequenceGapAcrossWrapPreservesMissingTime() {
+    for (auto previous_seq : { 60000, 65534 }) {
+        for (auto old_raw_stamp : { 32000U, 0xfffff000U }) {
+            G711Pipeline pipeline(32000, 1);
+            const uint16_t next_seq = previous_seq == 60000 ? 1000 : 1;
+            const auto elapsed_samples = uint32_t(uint16_t(next_seq - previous_seq)) * 1280;
+            pipeline.input(previous_seq, old_raw_stamp, 1000000, 1280);
+            // A separate SR correction must not replace the actual missing
+            // RTP duration with the receiver's NTP/sample origin.
+            pipeline.input(next_seq, old_raw_stamp + elapsed_samples, 1000000 + elapsed_samples / 32 + 75, 1280);
+            const auto &exact = exactFrame(pipeline.frames.back());
+            require(exact.discontinuity && exact.sample_stamp == 32000000ULL + elapsed_samples,
+                    "forward loss across sequence/RTP wrap was reanchored as a restart");
+            pipeline.encoder.flush();
+            pipeline.captured.checkPayload(pipeline.expected);
+        }
+    }
+}
+
+void testForwardSequenceRestartProbationGuards() {
+    for (auto second_seq : { 1000, 1001, 1002 }) {
+        G711Pipeline pipeline(32000, 1);
+        pipeline.input(60000, 500000000, 1000000, 1280);
+        pipeline.decoder->inputRtp(pipeline.packet(1000, 160000, 1000000, 1280, 1280), false);
+        // A duplicate, a missing sequence, or a pair one sample outside the
+        // phase bound must not commit an unconfirmed clock restart.
+        const auto raw_stamp = 161280U + (second_seq == 1001 ? 1281 : 0);
+        pipeline.decoder->inputRtp(pipeline.packet(second_seq, raw_stamp, 1000040, 1280, 2560), false);
+        require(pipeline.frames.size() == 1, "invalid positive-sequence probation pair confirmed a restart");
+        pipeline.input(60001, 500001280, 1000040, 1280);
+        pipeline.checkContinuous(32000000);
+    }
+}
+
 void testSameSsrcRestartProbationPhaseBounds() {
     for (auto rate : { 16000, 32000 }) {
         for (auto channels : { 1, 2 }) {
@@ -998,6 +1088,14 @@ int main() {
         }
     }
     run("G711 same-SSRC restart probation phase bounds", testSameSsrcRestartProbationPhaseBounds);
+    for (auto previous_seq : { 20000, 33768, 33769, 60000 }) {
+        for (auto channels : { 1, 2 }) {
+            run("G711 receiver backward-clock restart " + std::to_string(previous_seq) + "->1000/" + std::to_string(channels),
+                [=] { testReceiverSameSsrcBackwardClockRestart(previous_seq, 32000, channels); });
+        }
+    }
+    run("G711 forward loss across sequence and RTP wrap", testForwardSequenceGapAcrossWrapPreservesMissingTime);
+    run("G711 positive-sequence restart probation guards", testForwardSequenceRestartProbationGuards);
     run("G711 same-SSRC restart probation sequence guards", testSameSsrcRestartProbationSequenceGuards);
     run("G711 persistent bounded raw phase does not accumulate", testPersistentBoundedRawPhaseDoesNotAccumulate);
     run("G711 opposite bounded raw phase plateaus", testOppositeRawPhasePlateausRemainBounded);
