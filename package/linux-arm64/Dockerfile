@@ -3,6 +3,7 @@
 FROM debian:11@sha256:32fc609441a9c8417b2bb5faa62a60afd6af19013e8e82fdeed5d08dc7ac1ad9
 
 ARG DEBIAN_FRONTEND=noninteractive
+ARG DEBIAN_SNAPSHOT=20260831T000000Z
 ARG ACTIONLINT_VERSION=1.7.12
 ARG ACTIONLINT_SHA256=325e971b6ba9bfa504672e29be93c24981eeb1c07576d730e9f7c8805afff0c6
 ARG HADOLINT_VERSION=2.14.0
@@ -10,8 +11,13 @@ ARG HADOLINT_SHA256=331f1d3511b84a4f1e3d18d52fec284723e4019552f4f47b19322a53ce9a
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
+RUN printf '%s\n' \
+        "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT} bullseye main" \
+        "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT} bullseye-updates main" \
+        "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT} bullseye-security main" \
+        >/etc/apt/sources.list \
+    && apt-get -o Acquire::Retries=5 update \
+    && apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
         autoconf \
         automake \
         binutils \
