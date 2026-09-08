@@ -47,6 +47,9 @@ private:
     uint32_t _last_raw_stamp = 0;
     uint32_t _expected_raw_stamp = 0;
     uint64_t _next_sample_stamp = 0;
+    uint64_t _last_packet_samples = 0;
+    uint64_t _same_stamp_samples = 0;
+    uint64_t _batch_remaining_samples = 0;
     RtpPacket::Ptr _restart_packet;
     bool _restart_confirmed = false;
     struct RecentPacket {

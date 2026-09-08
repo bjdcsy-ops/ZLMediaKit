@@ -395,8 +395,10 @@ uint64_t NtpStamp::getNtpStampUS(uint32_t rtp_stamp, uint32_t sample_rate) {
         if (_last_rtp_stamp < loop_delta_hz && rtp_stamp > UINT32_MAX - loop_delta_hz) {
             // 应该是rtp时间戳溢出+乱序  [AUTO-TRANSLATED:13529fd6]
             // It should be rtp timestamp overflow + out of order
-            uint64_t max_rtp_us = uint64_t(UINT32_MAX) * 1000000 / sample_rate;
-            return _last_ntp_stamp_us + diff_us - max_rtp_us;
+            // Subtract in the 32-bit RTP domain before conversion to avoid
+            // losing precision around the 2^32 wrap boundary.
+            auto backward_ticks = uint32_t(_last_rtp_stamp - rtp_stamp);
+            return _last_ntp_stamp_us - uint64_t(backward_ticks) * 1000000 / sample_rate;
         }
         // 不明原因的时间戳大幅跳跃，直接返回上次值  [AUTO-TRANSLATED:952b769c]
         // The timestamp jumps significantly for unknown reasons, directly return the last value
@@ -420,8 +422,8 @@ uint64_t NtpStamp::getNtpStampUS(uint32_t rtp_stamp, uint32_t sample_rate) {
     if (rtp_stamp < loop_delta_hz && _last_rtp_stamp > UINT32_MAX - loop_delta_hz) {
         // 确定是时间戳溢出  [AUTO-TRANSLATED:322274c3]
         // Determine if it is a timestamp overflow
-        uint64_t max_rtp_us = uint64_t(UINT32_MAX) * 1000000 / sample_rate;
-        update(rtp_stamp, _last_ntp_stamp_us + (max_rtp_us - diff_us));
+        auto forward_ticks = uint32_t(rtp_stamp - _last_rtp_stamp);
+        update(rtp_stamp, _last_ntp_stamp_us + uint64_t(forward_ticks) * 1000000 / sample_rate);
         return _last_ntp_stamp_us;
     }
     // 不明原因的时间戳回退，直接返回上次值  [AUTO-TRANSLATED:c5105c14]

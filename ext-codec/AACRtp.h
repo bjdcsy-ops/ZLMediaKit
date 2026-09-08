@@ -38,10 +38,13 @@ public:
      * [AUTO-TRANSLATED:2993fcbe]
      */
     bool inputRtp(const RtpPacket::Ptr &rtp, bool key_pos = false) override;
+    void setOpt(int opt, const toolkit::Any &param) override;
 
 private:
     void obtainFrame();
-    void flushData();
+    void flushData(const RtpPacket::Ptr &rtp, uint32_t skipped_samples = 0);
+    void resetSampleClock();
+    void normalizeSampleClock(uint16_t seq, uint32_t skipped_samples);
 
 private:
     bool _have_packet = false;
@@ -52,6 +55,14 @@ private:
     size_t _fragment_size = 0;
     uint8_t _fragment_index = 0;
     FrameImp::Ptr _frame;
+    uint32_t _clock_rate = 0;
+    uint32_t _frame_rtp_stamp = 0;
+    uint32_t _last_au_stamp = 0;
+    uint32_t _next_au_stamp = 0;
+    uint16_t _last_au_seq = 0;
+    bool _have_au = false;
+    bool _sample_clock_active = false;
+    bool _sample_clock_blocked = false;
 };
 
 

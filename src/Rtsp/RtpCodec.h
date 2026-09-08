@@ -111,7 +111,8 @@ public:
     virtual void setAudioInfo(int sample_rate, int channels) {}
 
     enum {
-        RTP_ENCODER_PKT_DUR_MS = 1 // 主要应用于g711 rtp 打包器每个包的时间长度，option_value 为int*, option_len 为4
+        RTP_ENCODER_PKT_DUR_MS = 1, // 主要应用于g711 rtp 打包器每个包的时间长度，option_value 为int*, option_len 为4
+        RTP_DECODER_AAC_LIVE_FMTP = 2 // std::string: original AAC fmtp, only for streams without a declared VOD range
     };
     /**
      * @brief 设置rtp打包器与解包器的相关参数，主要应用与g711 rtp 打包器，使用方法类似setsockopt

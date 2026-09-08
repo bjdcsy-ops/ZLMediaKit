@@ -8,7 +8,10 @@
  * may be found in the AUTHORS file in the root of the source tree.
  */
 
+#include <algorithm>
+#include <cstdlib>
 #include "AACRtp.h"
+#include "Common/Parser.h"
 
 namespace mediakit{
 
@@ -46,6 +49,103 @@ AACRtpDecoder::AACRtpDecoder() {
     obtainFrame();
 }
 
+void AACRtpDecoder::setOpt(int opt, const toolkit::Any &param) {
+    if (opt != RTP_DECODER_AAC_LIVE_FMTP) {
+        return;
+    }
+    _clock_rate = 0;
+    resetSampleClock();
+    if (_fragment_size) {
+        obtainFrame();
+    }
+    _fragment_size = 0;
+    _drop_fragment = _have_packet = false;
+    if (!param.is<std::string>()) {
+        return;
+    }
+    auto fmtp = Parser::parseArgs(param.get<std::string>(), ";", "=");
+    for (auto key : { "mode", "config", "sizelength", "indexlength", "indexdeltalength" }) {
+        if (fmtp.count(key) != 1) {
+            return;
+        }
+    }
+    if (strcasecmp(fmtp["mode"].c_str(), "AAC-hbr") || fmtp["sizelength"] != "13"
+        || fmtp["indexlength"] != "3" || fmtp["indexdeltalength"] != "3"
+        || fmtp.count("streamtype") > 1 || (fmtp.count("streamtype") && fmtp["streamtype"] != "5")) {
+        return;
+    }
+    for (auto key : { "constantduration", "ctsdeltalength", "dtsdeltalength", "randomaccessindication",
+                      "streamstateindication", "auxiliarydatasizelength", "constantsize", "maxdisplacement",
+                      "de-interleavebuffersize" }) {
+        auto it = fmtp.find(key);
+        if (fmtp.count(key) > 1
+            || (it != fmtp.end() && it->second != (std::string(key) == "constantduration" ? "1024" : "0"))) {
+            return;
+        }
+    }
+    // Do not infer 1024 samples from the AAC name or AACTrack's truncated ASC.
+    // Longer ASC (including SBR), 960 samples and explicit-rate layouts retain
+    // their existing timestamps. This only recognizes the basic two-byte LC ASC.
+    const auto &config = fmtp["config"];
+    if (config.size() != 4) {
+        return;
+    }
+    uint16_t asc = 0;
+    for (unsigned char ch : config) {
+        auto nibble = ch >= '0' && ch <= '9' ? ch - '0'
+            : ch >= 'a' && ch <= 'f' ? ch - 'a' + 10 : ch >= 'A' && ch <= 'F' ? ch - 'A' + 10 : -1;
+        if (nibble < 0) {
+            return;
+        }
+        asc = (asc << 4) | nibble;
+    }
+    static const uint32_t rates[] = { 96000, 88200, 64000, 48000, 44100, 32000, 24000,
+                                     22050, 16000, 12000, 11025, 8000, 7350 };
+    const size_t frequency = (asc >> 7) & 15;
+    auto channels = (asc >> 3) & 15;
+    if ((asc >> 11) == 2 && !(asc & 7) && frequency < sizeof(rates) / sizeof(rates[0])
+        && (channels == 1 || channels == 2)) {
+        _clock_rate = rates[frequency];
+    }
+}
+
+void AACRtpDecoder::resetSampleClock() {
+    _have_au = _sample_clock_active = _sample_clock_blocked = false;
+}
+
+void AACRtpDecoder::normalizeSampleClock(uint16_t seq, uint32_t skipped_samples) {
+    const auto stamp = _frame_rtp_stamp;
+    if (_have_au && stamp != _last_au_stamp) {
+        _sample_clock_blocked = false;
+    }
+    if (_have_au && !_sample_clock_blocked && seq != _last_au_seq && stamp == _last_au_stamp) {
+        // Complete AUs across packets, not fragments of one AU, prove batching.
+        // Before this evidence, anchor to the last emitted AU, so enabling the
+        // correction cannot move behind an already forwarded positive step.
+        _sample_clock_active = true;
+    }
+    if (_have_au && _sample_clock_active) {
+        _next_au_stamp += skipped_samples;
+        auto phase = int64_t(int32_t(stamp - _next_au_stamp));
+        if (std::abs(phase) <= int64_t(_clock_rate) * 80 / 1000) {
+            // Only remove raw RTP phase. Preserve the packet's NTP/SR mapping;
+            // this is not an SR filter, and no raw clock crosses the Frame API.
+            _frame->_dts = std::max<int64_t>(0, int64_t(_frame->_dts) - phase * 1000 / _clock_rate);
+            _next_au_stamp += 1024;
+        } else {
+            WarnL << "AAC RTP batch clock discontinuity: phase=" << phase << " samples";
+            _sample_clock_active = false;
+            _sample_clock_blocked = stamp == _last_au_stamp;
+            _next_au_stamp = stamp + 1024;
+        }
+    } else {
+        _next_au_stamp = stamp + 1024;
+    }
+    _last_au_stamp = stamp;
+    _last_au_seq = seq;
+    _have_au = true;
+}
+
 void AACRtpDecoder::obtainFrame() {
     // 从缓存池重新申请对象，防止覆盖已经写入环形缓存的对象  [AUTO-TRANSLATED:f85fe201]
     // Re-apply the object from the cache pool to prevent overwriting the object that has been written to the ring buffer
@@ -65,10 +165,14 @@ bool AACRtpDecoder::inputRtp(const RtpPacket::Ptr &rtp, bool key_pos) {
         // resets; a new timestamp must not be rejected by another seq gate.
         return false;
     }
+    if (!same_source || seq != static_cast<uint16_t>(_last_seq + 1) || rtp->sample_rate != _clock_rate) {
+        resetSampleClock();
+    }
     if (!same_stamp) {
         // An incomplete AU belongs to its original RTP timestamp/SSRC only.
         if (_fragment_size) {
             obtainFrame();
+            resetSampleClock();
         }
         _fragment_size = 0;
         _drop_fragment = false;
@@ -88,6 +192,7 @@ bool AACRtpDecoder::inputRtp(const RtpPacket::Ptr &rtp, bool key_pos) {
         obtainFrame();
         _fragment_size = 0;
         _drop_fragment = true;
+        resetSampleClock();
         return false;
     };
 
@@ -155,7 +260,7 @@ bool AACRtpDecoder::inputRtp(const RtpPacket::Ptr &rtp, bool key_pos) {
                 // Keep the first fragment's NTP mapping even if an SR arrived
                 // between fragments of this same RTP timestamp.
                 _fragment_size = 0;
-                flushData();
+                flushData(rtp);
             } else if (rtp->getHeader()->mark) {
                 return discard_fragment();
             }
@@ -167,6 +272,7 @@ bool AACRtpDecoder::inputRtp(const RtpPacket::Ptr &rtp, bool key_pos) {
         // (AAC-LC with frameLengthFlag=0). 960-sample/HE-AAC bundle timing
         // requires ASC/constantDuration support, not packet-arrival inference.
         _frame->_dts = stamp + (au_offset ? au_offset * 1024 * 1000 / rtp->sample_rate : 0);
+        _frame_rtp_stamp = rtp_stamp + au_offset * 1024;
         if (remaining < size) {
             // Fragmentation carries one AU per RTP packet. A terminal packet
             // without all bytes is truncated and cannot seed the next AU.
@@ -180,18 +286,22 @@ bool AACRtpDecoder::inputRtp(const RtpPacket::Ptr &rtp, bool key_pos) {
         } else {
             _frame->_buffer.append(reinterpret_cast<const char *>(ptr), size);
             ptr += size;
-            flushData();
+            flushData(rtp, i ? index * 1024 : 0);
         }
     }
     return false;
 }
 
-void AACRtpDecoder::flushData() {
+void AACRtpDecoder::flushData(const RtpPacket::Ptr &rtp, uint32_t skipped_samples) {
     auto ptr = reinterpret_cast<const uint8_t *>(_frame->data());
     if (_frame->size() > ADTS_HEADER_LEN && ptr[0] == 0xFF && (ptr[1] & 0xF0) == 0xF0) {
         // adts头打入了rtp包，不符合规范，兼容EasyPusher的bug  [AUTO-TRANSLATED:203a5ee9]
         // The adts header is inserted into the rtp packet, which is not compliant with the specification, compatible with the bug of EasyPusher
         _frame->_prefix_size = ADTS_HEADER_LEN;
+        // ADTS may contain several frames or raw data blocks in one RTP AU.
+        resetSampleClock();
+    } else if (_clock_rate && rtp->sample_rate == _clock_rate) {
+        normalizeSampleClock(rtp->getSeq(), skipped_samples);
     }
     RtpCodec::inputFrame(_frame);
     obtainFrame();

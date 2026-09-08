@@ -19,21 +19,24 @@ namespace mediakit {
 
 void RtspMuxer::onRtp(RtpPacket::Ptr in, bool is_key) {
     if (_live) {
-        auto &ref = _tracks[in->track_index];
-        if (ref.rtp_stamp != in->getHeader()->stamp) {
-            // rtp时间戳变化才计算ntp，节省cpu资源  [AUTO-TRANSLATED:729d54f2]
-            // Only calculate NTP when the RTP timestamp changes, saving CPU resources
-            int64_t stamp_ms_inc;
-            // 求rtp时间戳增量  [AUTO-TRANSLATED:f6ba022f]
-            // Get the RTP timestamp increment
-            ref.stamp.revise(in->ntp_stamp, in->ntp_stamp, stamp_ms_inc, stamp_ms_inc);
-            ref.rtp_stamp = in->getHeader()->stamp;
-            ref.ntp_stamp = stamp_ms_inc + _ntp_stamp_start;
+        if (!_ntp_stamp_initialized) {
+            _media_stamp_start = in->ntp_stamp;
+            _ntp_stamp_start = getCurrentMillisecond(true);
+            _ntp_stamp_initialized = true;
         }
 
-        // rtp拦截入口，此处统一赋值ntp  [AUTO-TRANSLATED:1412435a]
-        // RTP interception entry, set NTP here uniformly
-        in->ntp_stamp = ref.ntp_stamp;
+        // FrameStamp exposes signed PTS through uint64_t, including negatives
+        // around the initial DTS origin. Use the signed modular difference so
+        // crossing zero keeps one common offset without signed overflow.
+        const auto delta = in->ntp_stamp - _media_stamp_start;
+        if (delta <= INT64_MAX) {
+            CHECK(delta <= UINT64_MAX - _ntp_stamp_start, "RTSP NTP timestamp overflow");
+            in->ntp_stamp = _ntp_stamp_start + delta;
+        } else {
+            const auto backward = UINT64_MAX - delta + 1;
+            CHECK(backward <= _ntp_stamp_start, "RTSP NTP timestamp underflow");
+            in->ntp_stamp = _ntp_stamp_start - backward;
+        }
     } else {
         // 点播情况下设置ntp时间戳为rtp时间戳加基准ntp时间戳  [AUTO-TRANSLATED:b9f77de4]
         // In on-demand scenarios, set the NTP timestamp to the RTP timestamp plus the base NTP timestamp
@@ -131,26 +134,8 @@ bool RtspMuxer::addTrack(const Track::Ptr &track) {
     // 添加其sdp  [AUTO-TRANSLATED:80958925]
     // Add its SDP
     _sdp.append(str);
-    trySyncTrack();
-
-    // rtp的时间戳是pts，允许回退  [AUTO-TRANSLATED:f4a977fc]
-    // The RTP timestamp is PTS, allowing rollback
-    if (track->getTrackType() == TrackVideo) {
-        ref.stamp.enableRollback(true);
-    }
     ++_index;
     return true;
-}
-
-void RtspMuxer::trySyncTrack() {
-    Stamp *first = nullptr;
-    for (auto &pr : _tracks) {
-        if (!first) {
-            first = &pr.second.stamp;
-        } else {
-            pr.second.stamp.syncTo(*first);
-        }
-    }
 }
 
 bool RtspMuxer::inputFrame(const Frame::Ptr &frame) {
@@ -177,6 +162,8 @@ RtpRing::RingType::Ptr RtspMuxer::getRtpRing() const {
 void RtspMuxer::resetTracks() {
     _sdp.clear();
     _tracks.clear();
+    _ntp_stamp_initialized = false;
+    _media_stamp_start = 0;
     CLEAR_ARR(_track_existed);
 }
 

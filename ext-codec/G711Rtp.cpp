@@ -9,6 +9,8 @@ namespace mediakit {
 namespace {
 
 constexpr uint32_t kMaxBounceMs = 20;
+constexpr uint32_t kMaxLongPacketPhaseMs = 40;
+constexpr uint32_t kMaxBatchMs = 80;
 constexpr int64_t kNtpDeadbandUs = 1000;
 constexpr uint64_t kNtpSlewUsPerSecond = 1000;
 constexpr int64_t kNtpDiscontinuityUs = 250000;
@@ -35,6 +37,7 @@ void G711RtpDecoder::setAudioInfo(int sample_rate, int channels) {
         _have_clock = false;
         _restart_confirmed = true;
         _restart_packet.reset();
+        _last_packet_samples = 0;
         _recent_count = _recent_pos = 0;
     }
     _sample_rate = sample_rate;
@@ -51,6 +54,7 @@ bool G711RtpDecoder::inputRtp(const RtpPacket::Ptr &rtp, bool) {
     }
     const auto samples = uint64_t(size / _channels);
     const auto bounce_limit = std::min<uint64_t>(uint64_t(_sample_rate) * kMaxBounceMs / 1000, samples / 2);
+    const auto batch_limit = uint64_t(_sample_rate) * kMaxBatchMs / 1000;
     const auto seq = rtp->getSeq();
     const auto ssrc = rtp->getSSRC();
     const auto raw_stamp = rtp->getStamp();
@@ -61,7 +65,11 @@ bool G711RtpDecoder::inputRtp(const RtpPacket::Ptr &rtp, bool) {
     // A reset such as 60000 -> 1000 has a positive signed sequence delta.
     // Forward packet loss cannot explain a backwards sample clock beyond the
     // phase bound; confirm that case before applying its old/new RTP offset.
-    const auto backward_clock_gap = seq_delta > 1 && raw_delta < -int64_t(bounce_limit);
+    // A missing packet inside a known batch can still carry that batch's old
+    // timestamp. Preserve the sequence-gap boundary below without mistaking
+    // this bounded phase for a backwards-clock sender restart.
+    const auto restart_limit = _batch_remaining_samples ? batch_limit : bounce_limit;
+    const auto backward_clock_gap = seq_delta > 1 && raw_delta < -int64_t(restart_limit);
     if (_have_clock && !restart && (seq_delta <= 0 || backward_clock_gap)) {
         // Normal input is already RTP-sorted. Reject duplicate/late packets,
         // but confirm a same-SSRC sequence restart after two progressing packets
@@ -102,13 +110,36 @@ bool G711RtpDecoder::inputRtp(const RtpPacket::Ptr &rtp, bool) {
     }
     _restart_packet.reset();
 
+    // Some senders split a batch into consecutive G711 packets sharing one
+    // timestamp. That is evidence for a bounded batch, not duplicate samples.
+    // Keep emitting immediately and expire this allowance by sample duration
+    // once timestamps advance normally. Never move the cumulative raw axis to
+    // follow each batch: a frozen clock or accumulated drift must still fail.
+    const auto contiguous = _have_clock && !restart && seq_delta == 1;
+    const auto same_stamp = contiguous && raw_stamp == _last_raw_stamp;
+    const auto same_stamp_samples = same_stamp ? _same_stamp_samples + samples : samples;
+    auto batch_remaining = contiguous ? _batch_remaining_samples : 0;
+    if (same_stamp) {
+        // Exhausting the batch span restores the ordinary bound; a variable
+        // long packet whose phase was already valid must not become invalid.
+        batch_remaining = same_stamp_samples <= batch_limit ? batch_limit : 0;
+    }
+    const auto phase_limit = batch_remaining ? batch_limit : bounce_limit;
+    // Equal long packets can carry a bounded phase excursion shorter than one
+    // input packet. Keep short/variable packets and restart probation on their
+    // existing bounds; repeated/backwards timestamps do not use this allowance.
+    const auto long_packet_phase = contiguous && int32_t(raw_stamp - _last_raw_stamp) > 0
+        && samples == _last_packet_samples && samples > uint64_t(_sample_rate) * kMaxBounceMs / 1000
+        && uint64_t(std::abs(raw_delta)) < std::min<uint64_t>(_last_packet_samples,
+                                                           uint64_t(_sample_rate) * kMaxLongPacketPhaseMs / 1000);
+
     // Bound phase error against the cumulative sample axis, not by packet count.
     // A small fixed offset cannot be distinguished from a longer excursion when
     // sequence coverage and samples are complete. Normalize both without moving
     // the expected axis; accumulated drift still crosses this amplitude bound.
     bool discontinuity = restart || (_have_clock && seq_delta != 1);
     if (_have_clock && !discontinuity && raw_delta) {
-        discontinuity = uint64_t(std::abs(raw_delta)) > bounce_limit;
+        discontinuity = uint64_t(std::abs(raw_delta)) > phase_limit && !long_packet_phase;
     }
 
     int64_t ntp_us = rtp->getStampMS() * 1000;
@@ -179,6 +210,10 @@ bool G711RtpDecoder::inputRtp(const RtpPacket::Ptr &rtp, bool) {
     _seq = seq;
     _ssrc = ssrc;
     _last_raw_stamp = raw_stamp;
+    _last_packet_samples = samples;
+    _same_stamp_samples = discontinuity ? samples : same_stamp_samples;
+    // Charge this packet after testing its start, including variable payloads.
+    _batch_remaining_samples = !discontinuity && batch_remaining > samples ? batch_remaining - samples : 0;
     _recent_packets[_recent_pos] = { seq, raw_stamp, uint32_t(samples) };
     _recent_pos = (_recent_pos + 1) % _recent_packets.size();
     _recent_count = std::min(_recent_count + 1, _recent_packets.size());

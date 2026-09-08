@@ -13,7 +13,6 @@
 
 #include "Extension/Frame.h"
 #include "Common/MediaSink.h"
-#include "Common/Stamp.h"
 #include "RtpCodec.h"
 
 namespace mediakit{
@@ -109,7 +108,6 @@ public:
 
 private:
     void onRtp(RtpPacket::Ptr in, bool is_key);
-    void trySyncTrack();
 
 private:
     bool _live = true;
@@ -117,12 +115,11 @@ private:
 
     uint8_t _index {0};
     uint64_t _ntp_stamp_start;
+    uint64_t _media_stamp_start = 0;
+    bool _ntp_stamp_initialized = false;
     std::string _sdp;
 
     struct TrackInfo {
-        Stamp stamp;
-        uint32_t rtp_stamp { 0 };
-        uint64_t ntp_stamp { 0 };
         RtpCodec::Ptr encoder;
     };
 

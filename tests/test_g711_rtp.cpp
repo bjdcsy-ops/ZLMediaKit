@@ -746,7 +746,8 @@ void testOppositeRawPhasePlateausRemainBounded() {
 void testGradualRawDriftCrossesAbsolutePhaseBound() {
     for (auto rate : { 16000, 32000 }) {
         auto samples = uint32_t(rate * 40 / 1000);
-        auto limit = uint32_t(rate * 20 / 1000);
+        // Equal 40 ms packets now allow phase strictly below one packet.
+        auto limit = uint32_t(rate * 40 / 1000 - 1);
         for (int direction : { -1, 1 }) {
             G711Pipeline pipeline(rate, 1);
             for (unsigned i = 0; i <= 2 * (limit + 1); ++i) {
@@ -826,7 +827,9 @@ void testRawPhaseCorrectionMagnitudeBoundary() {
                 auto raw_ms = natural_ms + direction * error_ms;
                 pipeline.input(2, uint32_t(raw_ms * 32), raw_ms, bytes);
                 auto &exact = exactFrame(pipeline.frames.back());
-                bool boundary = error_ms > limit_ms;
+                // The fixed 40/80 ms pairs additionally accept 21 ms phase;
+                // short packets retain their original half-duration bound.
+                bool boundary = duration_ms == 10 ? error_ms > limit_ms : error_ms >= 40;
                 require(exact.discontinuity == boundary, "raw correction exceeded its magnitude bound");
                 require(exact.sample_stamp == uint64_t((boundary ? raw_ms : natural_ms) * 32),
                         "raw correction magnitude boundary changed the wrong sample phase");
@@ -834,6 +837,115 @@ void testRawPhaseCorrectionMagnitudeBoundary() {
                 pipeline.captured.checkPayload(pipeline.expected);
             }
         }
+    }
+}
+
+void testLongPacketPhaseBoundaries() {
+    for (auto codec : { CodecG711A, CodecG711U }) {
+        for (auto rate : { 8000, 16000, 32000, 48000, 64000 }) {
+            for (auto channels : { 1, 2 }) {
+                for (auto duration_ms : { 40, 80 }) {
+                    const auto samples = rate * duration_ms / 1000;
+                    const auto cap = rate * 40 / 1000;
+                    struct Case {
+                        int phase;
+                        bool boundary;
+                    };
+                    const Case cases[] = {
+                        { rate * 30 / 1000, false }, { -rate * 30 / 1000, false },
+                        { cap - 1, false }, { 1 - cap, false },
+                        { cap, true }, { cap + 1, true },
+                        // At 40 ms, exactly -40 ms is a shared timestamp and
+                        // retains the existing 80 ms batch allowance.
+                        { -cap, duration_ms != 40 }, { -cap - 1, true },
+                    };
+                    for (const auto &item : cases) {
+                        G711Pipeline pipeline(rate, channels, codec);
+                        pipeline.input(1, rate, 1000, samples * channels);
+                        const auto raw = rate + samples + item.phase;
+                        pipeline.input(2, raw, uint64_t(raw) * 1000 / rate, samples * channels);
+                        const auto &exact = exactFrame(pipeline.frames.back());
+                        const auto expected = rate + samples + (item.boundary ? item.phase : 0);
+                        require(exact.discontinuity == item.boundary && exact.sample_stamp == uint64_t(expected),
+                                "long-packet strict phase boundary changed: rate=" + std::to_string(rate)
+                                    + ", channels=" + std::to_string(channels)
+                                    + ", duration_ms=" + std::to_string(duration_ms)
+                                    + ", phase_samples=" + std::to_string(item.phase));
+                        if (!item.boundary) {
+                            require(exact.ntp_stamp_us == uint64_t(1000 + duration_ms) * 1000,
+                                    "long-packet phase leaked into normalized NTP");
+                            pipeline.checkContinuous(rate);
+                        } else {
+                            pipeline.encoder.flush();
+                            pipeline.captured.checkPayload(pipeline.expected, channels);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+void testLongPacketAllowanceKeepsOtherBoundaries() {
+    struct Case {
+        unsigned first_ms, second_ms, phase_ms;
+        bool boundary;
+    };
+    const Case cases[] = {
+        { 10, 10, 6, true }, { 20, 20, 11, true },
+        { 40, 10, 30, true }, { 40, 80, 30, true }, { 80, 40, 30, true },
+        { 10, 80, 10, false }, { 20, 40, 10, false },
+    };
+    for (auto codec : { CodecG711A, CodecG711U }) {
+        for (const auto &item : cases) {
+            G711Pipeline pipeline(16000, 2, codec);
+            pipeline.input(1, 16000, 1000, item.first_ms * 16 * 2);
+            const auto raw_ms = 1000 + item.first_ms + item.phase_ms;
+            pipeline.input(2, raw_ms * 16, raw_ms, item.second_ms * 16 * 2);
+            const auto &exact = exactFrame(pipeline.frames.back());
+            require(exact.discontinuity == item.boundary,
+                    "long-packet allowance changed a short or variable-payload boundary");
+            pipeline.encoder.flush();
+            pipeline.captured.checkPayload(pipeline.expected, 2);
+        }
+        for (bool change_ssrc : { false, true }) {
+            G711Pipeline pipeline(16000, 1, codec);
+            pipeline.input(1, 16000, 1000, 640);
+            auto packet = pipeline.packet(change_ssrc ? 2 : 3, 17120, 1070, 640,
+                                          pipeline.expected.size(), change_ssrc ? 18 : 17);
+            pipeline.expected.append(reinterpret_cast<const char *>(packet->getPayload()), 640);
+            pipeline.decoder->inputRtp(packet, false);
+            require(pipeline.frames.size() == 2 && exactFrame(pipeline.frames.back()).discontinuity
+                        && exactFrame(pipeline.frames.back()).sample_stamp == 17120,
+                    "long-packet allowance hid a sequence gap or SSRC change");
+            pipeline.encoder.flush();
+            pipeline.captured.checkPayload(pipeline.expected);
+        }
+        G711Pipeline frozen(16000, 1, codec);
+        for (unsigned i = 0; i < 3; ++i) {
+            frozen.input(i, 16000, 1000, 640);
+            require(exactFrame(frozen.frames.back()).discontinuity == (i == 2),
+                    "long packets escaped the shared-timestamp duration bound");
+        }
+        frozen.encoder.flush();
+        frozen.captured.checkPayload(frozen.expected);
+    }
+}
+
+void testPersistentLongPacketPhase() {
+    // Metadata cannot distinguish a bounded plateau from a real short pause:
+    // the accepted policy normalizes both, including their return to zero.
+    for (int phase_ms : { -39, -30, -21, 21, 30, 39 }) {
+        G711Pipeline pipeline(16000, 1);
+        for (unsigned i = 0; i < 102; ++i) {
+            const auto natural_ms = 1000 + i * 40;
+            const auto raw_ms = int64_t(natural_ms) + (i && i <= 100 ? phase_ms : 0);
+            pipeline.input(i, uint32_t(raw_ms * 16), raw_ms, 640);
+            const auto &exact = exactFrame(pipeline.frames.back());
+            require(!exact.discontinuity && exact.sample_stamp == uint64_t(natural_ms) * 16,
+                    "long-packet phase plateau or return moved the cumulative sample axis");
+        }
+        pipeline.checkContinuous(16000);
     }
 }
 
@@ -859,32 +971,34 @@ void testDecoderRtpAndSequenceWrap() {
 }
 
 void testCacheAndTimestampWrappers() {
-    for (int kind = 0; kind < 3; ++kind) {
-        G711Pipeline pipeline(32000, 1);
-        pipeline.wrap = [=](const Frame::Ptr &input) -> Frame::Ptr {
-            if (kind == 0) {
-                auto cached = Frame::getCacheAbleFrame(input);
-                require(cached.get() == input.get(), "cacheable G711 frame lost exact sample metadata");
-                return cached;
+    for (int phase_ms : { 10, 30 }) {
+        for (int kind = 0; kind < 3; ++kind) {
+            G711Pipeline pipeline(32000, 1);
+            pipeline.wrap = [=](const Frame::Ptr &input) -> Frame::Ptr {
+                if (kind == 0) {
+                    auto cached = Frame::getCacheAbleFrame(input);
+                    require(cached.get() == input.get(), "cacheable G711 frame lost exact sample metadata");
+                    return cached;
+                }
+                if (kind == 1) {
+                    return std::make_shared<FrameCacheAble>(input);
+                }
+                auto stamped = std::make_shared<FrameStamp>(input);
+                stamped->setStamp(input->dts() + 2000, input->pts() + 2000);
+                return stamped;
+            };
+            for (unsigned i = 0; i < 40; ++i) {
+                auto ms = uint64_t(1000 + i * 40 + (i == 5 ? phase_ms : i == 20 ? -phase_ms : 0));
+                pipeline.input(i, uint32_t(ms * 32), ms, 1280);
             }
-            if (kind == 1) {
-                return std::make_shared<FrameCacheAble>(input);
+            pipeline.encoder.flush();
+            pipeline.captured.checkPayload(pipeline.expected);
+            require(pipeline.captured.packets.front()->getStamp() == uint32_t((kind == 2 ? 3000 : 1000) * 32),
+                    "G711 metadata bypassed an explicit FrameStamp override");
+            for (size_t i = 1; i < pipeline.captured.packets.size(); ++i) {
+                require(static_cast<int32_t>(pipeline.captured.packets[i]->getStamp()
+                    - pipeline.captured.packets[i - 1]->getStamp()) > 0, "frame wrapper reintroduced G711 RTP rollback");
             }
-            auto stamped = std::make_shared<FrameStamp>(input);
-            stamped->setStamp(input->dts() + 2000, input->pts() + 2000);
-            return stamped;
-        };
-        for (unsigned i = 0; i < 40; ++i) {
-            auto ms = uint64_t(1000 + i * 40 + (i == 5 ? 10 : i == 20 ? -10 : 0));
-            pipeline.input(i, uint32_t(ms * 32), ms, 1280);
-        }
-        pipeline.encoder.flush();
-        pipeline.captured.checkPayload(pipeline.expected);
-        require(pipeline.captured.packets.front()->getStamp() == uint32_t((kind == 2 ? 3000 : 1000) * 32),
-                "G711 metadata bypassed an explicit FrameStamp override");
-        for (size_t i = 1; i < pipeline.captured.packets.size(); ++i) {
-            require(static_cast<int32_t>(pipeline.captured.packets[i]->getStamp()
-                - pipeline.captured.packets[i - 1]->getStamp()) > 0, "frame wrapper reintroduced G711 RTP rollback");
         }
     }
 }
@@ -970,6 +1084,495 @@ void testCapturedRawRtpAndSrReplay() {
     auto start = pipeline.captured.packets.front()->getStamp();
     pipeline.checkContinuous(start);
 }
+
+void testSharedBatchFormatsAndWrap() {
+    for (auto codec : { CodecG711A, CodecG711U }) {
+        for (auto rate : { 8000, 16000, 32000, 44100, 48000 }) {
+            for (auto channels : { 1, 2 }) {
+                for (bool wrap : { false, true }) {
+                    G711Pipeline pipeline(rate, channels, codec);
+                    const uint32_t raw_start = wrap ? 0xffffff00U : 123456U;
+                    const uint64_t ntp_start = wrap ? uint64_t(0xffffffffU) * 1000 / rate - 10 : 1000;
+                    const uint64_t sample_start = ntp_start * rate / 1000;
+                    const std::vector<std::vector<unsigned>> groups = { { 10, 20, 10 }, { 20, 10 }, { 10, 10, 30 } };
+                    uint64_t samples = 0;
+                    uint16_t seq = 65530;
+                    for (unsigned group = 0; group < 60; ++group) {
+                        const auto group_samples = samples;
+                        for (auto duration_ms : groups[group % groups.size()]) {
+                            auto bytes = uint64_t(duration_ms) * rate / 1000 * channels;
+                            pipeline.input(seq++, uint32_t(raw_start + group_samples),
+                                           ntp_start + group_samples * 1000 / rate, bytes);
+                            const auto &exact = exactFrame(pipeline.frames.back());
+                            require(!exact.discontinuity && exact.sample_stamp == sample_start + samples,
+                                    "shared variable-size batch changed its cumulative sample clock");
+                            require(exact.ntp_stamp_us == ntp_start * 1000 + samples * 1000000 / rate,
+                                    "shared variable-size batch changed its normalized NTP clock");
+                            require(exact.getCodecId() == codec && exact.sample_rate == rate
+                                        && exact.channels == channels && exact.size() == bytes,
+                                    "shared batch changed its G711 format or sample count");
+                            samples += bytes / channels;
+                        }
+                    }
+                    pipeline.checkContinuous(uint32_t(sample_start));
+                    uint64_t emitted = 0;
+                    for (const auto &packet : pipeline.captured.packets) {
+                        require(packet->ntp_stamp == ntp_start + emitted * 1000 / rate,
+                                "shared batch RTP and NTP clocks diverged during repacketization");
+                        emitted += packet->getPayloadSize() / channels;
+                    }
+                    require(emitted == samples, "shared batch repacketization changed total sample duration");
+                    require(!wrap || pipeline.captured.packets.back()->getStamp()
+                                < pipeline.captured.packets.front()->getStamp(),
+                            "shared batch wrap regression did not cross the output RTP boundary");
+                }
+            }
+        }
+    }
+}
+
+void testSharedBatchSequenceAndSsrcBoundaries() {
+    for (int boundary : { 0, 1, 2 }) {
+        G711Pipeline pipeline(16000, 1);
+        pipeline.input(10, 16000, 1000, 256);
+        pipeline.input(11, 16000, 1000, 256);
+        // A gap inside the same batch must be emitted as a real boundary,
+        // rather than mistaken for restart probation because raw time is held.
+        uint16_t seq = boundary == 2 ? 12 : 13;
+        uint32_t raw = boundary == 0 ? 16000 : boundary == 1 ? 16768 : 80000;
+        uint32_t ssrc = boundary == 2 ? 18 : 17;
+        auto input = [&](uint32_t stamp, bool discontinuity) {
+            auto packet = pipeline.packet(seq++, stamp, stamp / 16, 256, pipeline.expected.size(), ssrc);
+            pipeline.expected.append(reinterpret_cast<const char *>(packet->getPayload()), packet->getPayloadSize());
+            auto before = pipeline.frames.size();
+            pipeline.decoder->inputRtp(packet, false);
+            require(pipeline.frames.size() == before + 1, "shared-batch sequence/SSRC boundary lost or delayed audio");
+            require(exactFrame(pipeline.frames.back()).discontinuity == discontinuity,
+                    "shared-batch sequence/SSRC boundary did not reset the compatibility lease");
+        };
+        input(raw, true);
+        require(exactFrame(pipeline.frames.back()).sample_stamp == raw,
+                "shared-batch sequence/SSRC boundary did not preserve the new sample origin");
+        raw += 256 + 160;
+        input(raw, true); // Ten ms exceeds the ordinary half-packet limit of eight ms.
+        input(raw, false); // New shared-timestamp evidence can enable compatibility again.
+        input(raw + 512, false);
+        pipeline.encoder.flush();
+        pipeline.captured.checkPayload(pipeline.expected);
+    }
+}
+
+void testSharedBatchSameSsrcRestart() {
+    for (uint16_t old_seq : { 20000, 60000 }) {
+        G711Pipeline pipeline(16000, 1);
+        pipeline.input(old_seq, 160000, 10000, 256);
+        pipeline.input(old_seq + 1, 160000, 10000, 256);
+        // 60001 -> 1000 has a positive signed sequence delta. Its backward
+        // raw clock exceeds the batch bound and must still enter probation.
+        for (unsigned i = 0; i < 2; ++i) {
+            const auto bytes = 256;
+            auto packet = pipeline.packet(1000 + i, 80000, 5000, bytes, pipeline.expected.size());
+            pipeline.expected.append(reinterpret_cast<const char *>(packet->getPayload()), bytes);
+            pipeline.decoder->inputRtp(packet, false);
+            require(pipeline.frames.size() == (i ? 4 : 2),
+                    "shared-timestamp restart bypassed probation or lost its first packet");
+        }
+        require(exactFrame(pipeline.frames[2]).discontinuity && !exactFrame(pipeline.frames[3]).discontinuity,
+                "shared-timestamp restart did not create exactly one boundary");
+        require(exactFrame(pipeline.frames[2]).sample_stamp == 80000
+                    && exactFrame(pipeline.frames[3]).sample_stamp == 80256,
+                "shared-timestamp restart did not normalize its confirmed sample sequence");
+        pipeline.input(1002, 80000, 5000, 768); // Variable payload reaches exactly 80 ms in the group.
+        pipeline.input(1003, 81280, 5080, 256);
+        require(!exactFrame(pipeline.frames[4]).discontinuity && !exactFrame(pipeline.frames[5]).discontinuity
+                    && exactFrame(pipeline.frames[4]).sample_stamp == 80512
+                    && exactFrame(pipeline.frames[5]).sample_stamp == 81280,
+                "confirmed shared-timestamp restart did not continue on its new sample axis");
+        pipeline.encoder.flush();
+        pipeline.captured.checkPayload(pipeline.expected);
+    }
+}
+
+void testSharedBatchFrozenClockIsBounded() {
+    G711Pipeline pipeline(16000, 1);
+    unsigned since_boundary = 0;
+    for (unsigned i = 0; i < 40; ++i) {
+        pipeline.input(i, 16000, 1000, 256);
+        const auto boundary = exactFrame(pipeline.frames.back()).discontinuity;
+        require(i >= 5 || !boundary, "shared timestamp was rejected before its inclusive 80 ms duration bound");
+        require(i != 5 || boundary, "shared timestamp containing more than 80 ms was normalized indefinitely");
+        since_boundary = boundary ? 1 : since_boundary + 1;
+        require(since_boundary <= 5, "permanently frozen G711 timestamp escaped its bounded duration");
+    }
+    pipeline.encoder.flush();
+    pipeline.captured.checkPayload(pipeline.expected);
+
+    G711Pipeline variable(16000, 2);
+    const unsigned durations[] = { 10, 20, 50, 1 };
+    for (unsigned i = 0; i < 4; ++i) {
+        variable.input(i, 16000, 1000, durations[i] * 16 * 2);
+        require(exactFrame(variable.frames.back()).discontinuity == (i == 3),
+                "shared timestamp duration bound counted packets/bytes instead of channel samples");
+    }
+    variable.encoder.flush();
+    variable.captured.checkPayload(variable.expected, 2);
+
+    // A 10 ms packet followed by an 80 ms packet sharing its timestamp is
+    // already accepted by the ordinary 20 ms phase bound. Exceeding the batch
+    // duration limit must retain that existing behavior and all 90 ms of audio.
+    G711Pipeline legacy(16000, 1);
+    legacy.input(0, 16000, 1000, 160);
+    legacy.input(1, 16000, 1000, 1280);
+    legacy.input(2, 17440, 1090, 256);
+    const uint64_t stamps[] = { 16000, 16160, 17440 };
+    for (size_t i = 0; i < legacy.frames.size(); ++i) {
+        const auto &exact = exactFrame(legacy.frames[i]);
+        require(!exact.discontinuity && exact.sample_stamp == stamps[i]
+                    && exact.ntp_stamp_us == stamps[i] * 1000000 / 16000,
+                "overlong shared-timestamp group broke an input accepted by the ordinary phase bound");
+    }
+    legacy.checkContinuous(16000);
+}
+
+void testSharedBatchCumulativeDriftBound() {
+    for (int direction : { -1, 1 }) {
+        G711Pipeline pipeline(16000, 1);
+        bool crossed = false;
+        uint16_t seq = 0;
+        uint32_t last_raw = 0;
+        for (unsigned group = 0; group < 12 && !crossed; ++group) {
+            const auto raw_ms = int64_t(1000 + group * 32) + direction * int64_t(group * 8);
+            for (unsigned packet = 0; packet < 2; ++packet) {
+                last_raw = uint32_t(raw_ms * 16);
+                const auto phase = direction * int64_t(group * 128) - int64_t(packet * 256);
+                crossed = std::abs(phase) > 1280;
+                pipeline.input(seq++, last_raw, raw_ms, 256);
+                const auto &exact = exactFrame(pipeline.frames.back());
+                require(exact.discontinuity == crossed,
+                        "shared G711 batches reanchored each group or exceeded the absolute 80 ms phase bound");
+                require(exact.sample_stamp == (crossed ? last_raw : uint64_t(16000 + (seq - 1) * 256)),
+                        "shared G711 batch drift moved the sample axis before its explicit boundary");
+                if (crossed) {
+                    break;
+                }
+            }
+        }
+        require(crossed, "shared batch drift test did not cross its cumulative phase bound");
+        last_raw += 256 + 160;
+        pipeline.input(seq, last_raw, last_raw / 16, 256);
+        require(exactFrame(pipeline.frames.back()).discontinuity,
+                "shared batch phase discontinuity did not restore the ordinary half-packet bound");
+        pipeline.encoder.flush();
+        pipeline.captured.checkPayload(pipeline.expected);
+    }
+}
+
+void testSharedBatchLeaseExpiresBySampleDuration() {
+    for (const auto &durations : { std::vector<unsigned> { 16, 16, 16, 16, 16 },
+                                   std::vector<unsigned> { 48, 8, 8, 16 } }) {
+        G711Pipeline pipeline(16000, 1);
+        pipeline.input(0, 16000, 1000, 256);
+        pipeline.input(1, 16000, 1000, 256);
+        uint64_t elapsed_ms = 32;
+        uint16_t seq = 2;
+        for (auto duration_ms : durations) {
+            // The last shared packet starts at 16 ms; the 80 ms lease ends
+            // at sample time 96 ms, independent of subsequent packet lengths.
+            const bool boundary = elapsed_ms >= 96;
+            const auto raw_ms = 1000 + elapsed_ms + 10;
+            pipeline.input(seq++, raw_ms * 16, raw_ms, duration_ms * 16);
+            const auto &exact = exactFrame(pipeline.frames.back());
+            require(exact.discontinuity == boundary,
+                    "shared batch lease expired at packet end or remained active after 80 ms of samples");
+            require(exact.sample_stamp == (1000 + elapsed_ms + (boundary ? 10 : 0)) * 16,
+                    "shared batch lease changed the sample origin before expiry");
+            elapsed_ms += duration_ms;
+        }
+        require(exactFrame(pipeline.frames.back()).discontinuity,
+                "shared batch lease regression never reached its ordinary input boundary");
+        pipeline.encoder.flush();
+        pipeline.captured.checkPayload(pipeline.expected);
+    }
+}
+
+void testCapturedBatchTimestampReplay() {
+    struct Metadata {
+        uint64_t relative_us;
+        uint16_t seq;
+        uint32_t raw_stamp;
+        size_t bytes;
+    };
+    auto source = std::string(__FILE__);
+    auto path = source.substr(0, source.find_last_of("/\\") + 1) + "fixtures/g711_16k_batch_metadata.txt";
+    std::ifstream fixture(path);
+    require(fixture.good(), "cannot open G711 batch timestamp metadata fixture");
+    std::vector<Metadata> packets;
+    std::string line;
+    while (std::getline(fixture, line)) {
+        if (line.empty() || line[0] == '#') {
+            continue;
+        }
+        std::istringstream row(line);
+        Metadata packet;
+        require(bool(row >> packet.relative_us >> packet.seq >> packet.raw_stamp >> packet.bytes),
+                "invalid G711 batch timestamp metadata row");
+        require(packet.bytes == 256, "captured 16 kHz G711 packet no longer contains 16 ms of samples");
+        if (!packets.empty()) {
+            require(uint16_t(packet.seq - packets.back().seq) == 1,
+                    "G711 batch capture does not have continuous sequence coverage");
+            require(packet.relative_us >= packets.back().relative_us,
+                    "G711 batch capture receive order was changed");
+        }
+        packets.emplace_back(packet);
+    }
+    require(packets.size() == 940 && packets.front().relative_us == 0
+                && packets.back().relative_us == 14998683,
+            "G711 batch replay did not cover the captured 15-second window");
+    require(packets[0].raw_stamp == packets[1].raw_stamp && packets[1].raw_stamp == packets[2].raw_stamp
+                && packets[3].raw_stamp != packets[2].raw_stamp,
+            "G711 batch fixture no longer starts with three packets sharing one timestamp");
+
+    // Replay from every possible join point, including every 30/40/50 ms
+    // group and its tail. A join at the last packet of a batch has no shared
+    // timestamp evidence yet: its next timestamp jump must remain a boundary.
+    // Once a repeated timestamp is observed, sample time must stay continuous.
+    // Receive times document the capture order; replay deliberately does not
+    // sleep or feed wall time into the media clock. There are no captured SRs:
+    // this explicit mapping fixes the NTP origin for a deterministic receiver.
+    for (size_t first = 0; first < packets.size(); ++first) {
+        constexpr int rate = 16000;
+        constexpr uint64_t first_ntp_ms = 1000000;
+        constexpr uint64_t first_sample = first_ntp_ms * rate / 1000;
+        const bool initial_boundary = first + 1 < packets.size()
+            && packets[first + 1].raw_stamp != packets[first].raw_stamp;
+        const auto boundary_shift = initial_boundary
+            ? uint64_t(uint32_t(packets[first + 1].raw_stamp - packets[first].raw_stamp)) - packets[first].bytes
+            : 0;
+        const auto context = " at capture offset " + std::to_string(first);
+        G711Pipeline pipeline(rate, 1);
+        RtpTrackImp receiver;
+        receiver.setNtpStamp(packets[first].raw_stamp, first_ntp_ms);
+        size_t sorted = 0;
+        uint64_t decoded_samples = 0;
+        uint64_t segment_ntp_us = first_ntp_ms * 1000;
+        uint64_t segment_samples = 0;
+        receiver.setOnSorted([&](RtpPacket::Ptr packet) {
+            auto before = pipeline.frames.size();
+            pipeline.decoder->inputRtp(packet, false);
+            require(pipeline.frames.size() == before + 1,
+                    "G711 batch normalization buffered or lost a sorted input packet" + context);
+            const auto &exact = exactFrame(pipeline.frames.back());
+            const auto elapsed_samples = decoded_samples + (sorted ? boundary_shift : 0);
+            require(exact.discontinuity == (initial_boundary && sorted == 1),
+                    "G711 batch replay did not preserve exactly its unevidenced initial boundary" + context);
+            require(exact.sample_stamp == first_sample + elapsed_samples,
+                    "captured G711 batch timestamp moved the segment sample axis" + context);
+            if (initial_boundary && sorted == 1) {
+                // NtpStamp uses float conversion before millisecond rounding
+                // (800 samples can map to 49 ms). A real boundary adopts that
+                // receiver mapping, while its sample origin keeps the raw gap.
+                segment_ntp_us = packet->getStampMS() * 1000;
+                segment_samples = decoded_samples;
+            }
+            const auto expected_ntp_us = segment_ntp_us + (decoded_samples - segment_samples) * 1000000 / rate;
+            require(exact.ntp_stamp_us == expected_ntp_us
+                        && exact.pts() == exact.ntp_stamp_us / 1000,
+                    "captured G711 batch phase leaked into the normalized NTP clock" + context
+                        + ", seq=" + std::to_string(packet->getSeq())
+                        + ", actual_us=" + std::to_string(exact.ntp_stamp_us)
+                        + ", expected_us=" + std::to_string(expected_ntp_us)
+                        + ", receiver_ms=" + std::to_string(packet->getStampMS()));
+            require(exact.sample_rate == rate && exact.channels == 1
+                        && exact.size() == size_t(packet->getPayloadSize()),
+                    "G711 batch normalization changed audio parameters or frame sample count");
+            decoded_samples += exact.size();
+            ++sorted;
+        });
+        for (size_t i = first; i < packets.size(); ++i) {
+            const auto &metadata = packets[i];
+            auto packet = pipeline.packet(metadata.seq, metadata.raw_stamp, 0,
+                                          metadata.bytes, pipeline.expected.size());
+            pipeline.expected.append(reinterpret_cast<const char *>(packet->getPayload()), metadata.bytes);
+            receiver.inputRtp(TrackAudio, rate,
+                reinterpret_cast<uint8_t *>(packet->data()) + RtpPacket::kRtpTcpHeaderSize,
+                packet->size() - RtpPacket::kRtpTcpHeaderSize);
+            require(sorted == i - first + 1, "G711 batch receiver delayed a contiguous input packet");
+        }
+        receiver.flush();
+        pipeline.decoder->flush();
+        require(sorted == packets.size() - first && pipeline.frames.size() == sorted,
+                "G711 batch replay flush lost or duplicated decoded frames");
+        pipeline.encoder.flush();
+        pipeline.captured.checkPayload(pipeline.expected);
+        uint64_t emitted_samples = 0;
+        for (const auto &packet : pipeline.captured.packets) {
+            const bool before_boundary = initial_boundary && emitted_samples < packets[first].bytes;
+            const auto elapsed_samples = emitted_samples + (before_boundary ? 0 : boundary_shift);
+            require(packet->getStamp() == uint32_t(first_sample + elapsed_samples),
+                    "repacketized G711 batch lost continuous RTP sample time within a segment" + context);
+            const auto expected_ntp_ms = before_boundary ? first_ntp_ms + emitted_samples * 1000 / rate
+                : (segment_ntp_us + (emitted_samples - segment_samples) * 1000000 / rate) / 1000;
+            require(packet->ntp_stamp == expected_ntp_ms,
+                    "repacketized G711 batch NTP clock does not match its RTP sample clock" + context);
+            require(!before_boundary || emitted_samples + packet->getPayloadSize() <= packets[first].bytes,
+                    "repacketized G711 batch merged samples across its initial boundary" + context);
+            emitted_samples += packet->getPayloadSize();
+        }
+        require(emitted_samples == decoded_samples && emitted_samples == pipeline.expected.size(),
+                "G711 batch replay did not preserve the complete captured sample duration");
+    }
+}
+
+// Four windows contain original RTP metadata but deliberately exclude recorded
+// SRs: this is a raw-phase regression with an explicit synthetic NTP mapping,
+// not validation of the captured SR/NTP path or source connection attribution.
+struct G711LongPhasePacket {
+    uint64_t relative_us;
+    uint16_t seq;
+    uint32_t raw_stamp;
+    size_t bytes;
+};
+
+struct G711LongPhaseCapture {
+    std::string name;
+    CodecId codec;
+    size_t declared_packets;
+    std::vector<G711LongPhasePacket> packets;
+};
+
+const std::vector<G711LongPhaseCapture> &longPhaseCaptures() {
+    static const auto captures = [] {
+        auto source = std::string(__FILE__);
+        auto path = source.substr(0, source.find_last_of("/\\") + 1)
+            + "fixtures/g711_16k_long_packet_phase_metadata.txt";
+        std::ifstream fixture(path);
+        require(fixture.good(), "cannot open G711 long-packet phase fixture");
+        std::vector<G711LongPhaseCapture> result;
+        std::string line;
+        while (std::getline(fixture, line)) {
+            if (line.empty() || line[0] == '#') {
+                continue;
+            }
+            std::istringstream row(line);
+            char kind;
+            require(bool(row >> kind), "invalid G711 long-packet fixture row");
+            if (kind == 'W') {
+                G711LongPhaseCapture capture;
+                std::string codec;
+                int rate, channels;
+                require(bool(row >> capture.name >> codec >> rate >> channels >> capture.declared_packets)
+                            && (codec == "PCMA" || codec == "PCMU") && rate == 16000 && channels == 1,
+                        "invalid G711 long-packet fixture window");
+                capture.codec = codec == "PCMA" ? CodecG711A : CodecG711U;
+                result.emplace_back(std::move(capture));
+                continue;
+            }
+            require(kind == 'R' && !result.empty(), "G711 long-packet fixture packet lacks its window");
+            G711LongPhasePacket packet;
+            require(bool(row >> packet.relative_us >> packet.seq >> packet.raw_stamp >> packet.bytes)
+                        && packet.bytes == 640,
+                    "invalid G711 long-packet fixture packet");
+            auto &packets = result.back().packets;
+            if (packets.empty()) {
+                require(packet.relative_us == 0, "G711 long-packet fixture receipt origin changed");
+            } else {
+                require(uint16_t(packet.seq - packets.back().seq) == 1
+                            && int32_t(packet.raw_stamp - packets.back().raw_stamp) > 0
+                            && packet.relative_us >= packets.back().relative_us,
+                        "G711 long-packet fixture lost continuous sequence/positive timestamp order");
+            }
+            packets.emplace_back(packet);
+        }
+        const std::string names[] = { "h264-pcma", "h264-pcmu", "h265-pcma", "h265-pcmu" };
+        const size_t counts[] = { 1051, 1050, 1051, 1050 };
+        require(result.size() == 4, "G711 long-packet fixture does not cover all four captures");
+        for (size_t i = 0; i < result.size(); ++i) {
+            require(result[i].name == names[i] && result[i].declared_packets == counts[i]
+                        && result[i].packets.size() == counts[i],
+                    "G711 long-packet capture identity or duration changed");
+        }
+        return result;
+    }();
+    return captures;
+}
+
+void testCapturedLongPacketPhaseReplay(size_t window) {
+    const auto &capture = longPhaseCaptures().at(window);
+    const auto &packets = capture.packets;
+    constexpr int rate = 16000;
+    constexpr uint64_t first_ntp_ms = 1000000;
+    constexpr uint64_t first_sample = first_ntp_ms * rate / 1000;
+    // Every captured phase lies within a 30 ms diameter. Replaying all joins
+    // includes origins at 0/+10/+30 ms and proves correction is relative to the
+    // actual first accepted sample, not a favorable fixed phase in the fixture.
+    // All 4202 join positions total 2209202 real receiver inputs across windows.
+    for (size_t first = 0; first < packets.size(); ++first) {
+        const auto context = " in " + capture.name + " at join " + std::to_string(first);
+        G711Pipeline pipeline(rate, 1, capture.codec);
+        RtpTrackImp receiver;
+        receiver.setNtpStamp(packets[first].raw_stamp, first_ntp_ms);
+        size_t sorted = 0;
+        uint64_t decoded_samples = 0;
+        receiver.setOnSorted([&](RtpPacket::Ptr packet) {
+            const auto before = pipeline.frames.size();
+            pipeline.decoder->inputRtp(packet, false);
+            require(pipeline.frames.size() == before + 1,
+                    "long-packet phase handling delayed or lost a sorted frame" + context);
+            const auto &exact = exactFrame(pipeline.frames.back());
+            const auto expected_sample = first_sample + decoded_samples;
+            const auto expected_ntp_us = first_ntp_ms * 1000 + decoded_samples * 1000000 / rate;
+            if (exact.discontinuity || exact.sample_stamp != expected_sample) {
+                throw std::runtime_error("long-packet raw phase moved the cumulative sample clock" + context
+                    + ", seq=" + std::to_string(packet->getSeq())
+                    + ", boundary=" + std::to_string(exact.discontinuity)
+                    + ", actual_sample=" + std::to_string(exact.sample_stamp)
+                    + ", expected_sample=" + std::to_string(expected_sample));
+            }
+            if (exact.ntp_stamp_us != expected_ntp_us || exact.pts() != expected_ntp_us / 1000) {
+                throw std::runtime_error("long-packet raw phase leaked into the synthetic NTP clock" + context
+                    + ", seq=" + std::to_string(packet->getSeq())
+                    + ", actual_us=" + std::to_string(exact.ntp_stamp_us)
+                    + ", expected_us=" + std::to_string(expected_ntp_us)
+                    + ", receiver_ms=" + std::to_string(packet->getStampMS()));
+            }
+            require(exact.sample_rate == rate && exact.channels == 1 && exact.size() == 640
+                        && exact.getCodecId() == capture.codec,
+                    "long-packet phase replay changed codec, format or decoded sample count" + context);
+            decoded_samples += exact.size();
+            ++sorted;
+        });
+        for (size_t i = first; i < packets.size(); ++i) {
+            const auto &metadata = packets[i];
+            auto packet = pipeline.packet(metadata.seq, metadata.raw_stamp, 0,
+                                          metadata.bytes, pipeline.expected.size());
+            pipeline.expected.append(reinterpret_cast<const char *>(packet->getPayload()), metadata.bytes);
+            receiver.inputRtp(TrackAudio, rate,
+                reinterpret_cast<uint8_t *>(packet->data()) + RtpPacket::kRtpTcpHeaderSize,
+                packet->size() - RtpPacket::kRtpTcpHeaderSize);
+            require(sorted == i - first + 1, "long-packet receiver buffered a contiguous packet" + context);
+            require(pipeline.captured.packets.size() == 2 * sorted,
+                    "a complete 40 ms input did not immediately emit both 20 ms RTP packets" + context);
+        }
+        receiver.flush();
+        pipeline.decoder->flush();
+        pipeline.encoder.flush();
+        require(sorted == packets.size() - first && pipeline.frames.size() == sorted
+                    && pipeline.captured.packets.size() == 2 * sorted,
+                "long-packet phase replay flush lost or duplicated media" + context);
+        pipeline.captured.check(pipeline.expected, uint32_t(first_sample), 1, 96, 588);
+        uint64_t emitted_samples = 0;
+        for (const auto &packet : pipeline.captured.packets) {
+            require(packet->getPayloadSize() == 320
+                        && packet->getStamp() == uint32_t(first_sample + emitted_samples)
+                        && packet->ntp_stamp == first_ntp_ms + emitted_samples * 1000 / rate,
+                    "long-packet repacketization changed its exact RTP/NTP sample axis" + context);
+            emitted_samples += packet->getPayloadSize();
+        }
+        require(emitted_samples == decoded_samples && emitted_samples == pipeline.expected.size(),
+                "long-packet phase replay did not conserve its complete sample duration" + context);
+    }
+}
+
 
 #if defined(ENABLE_RTPPROXY)
 class RawPackets : public RawEncoderImp {
@@ -1069,6 +1672,17 @@ int main() {
     }
     run("transient SR reanchor does not reset sample clock", testTransientSenderReportReanchor);
     run("captured raw RTP and SR receiver replay", testCapturedRawRtpAndSrReplay);
+    run("captured shared batch timestamp receiver replay", testCapturedBatchTimestampReplay);
+    for (size_t window = 0; window < 4; ++window) {
+        run("captured G711 long-packet phase " + std::to_string(window),
+            [=] { testCapturedLongPacketPhaseReplay(window); });
+    }
+    run("shared G711 batch formats, variable payloads and wrap", testSharedBatchFormatsAndWrap);
+    run("shared G711 batch sequence and SSRC boundaries", testSharedBatchSequenceAndSsrcBoundaries);
+    run("shared G711 batch same-SSRC restart", testSharedBatchSameSsrcRestart);
+    run("shared G711 frozen timestamp duration bound", testSharedBatchFrozenClockIsBounded);
+    run("shared G711 cumulative phase bound", testSharedBatchCumulativeDriftBound);
+    run("shared G711 lease expires by sample duration", testSharedBatchLeaseExpiresBySampleDuration);
     run("G711 duplicate and late packets", testDecoderDuplicateAndLatePackets);
     run("G711 consecutive historical packets are not restart", testConsecutiveHistoricalPacketsAreNotRestart);
     run("G711 sequence gap preserves missing time", testDecoderSequenceGapPreservesMissingTime);
@@ -1103,6 +1717,9 @@ int main() {
     run("G711 variable payload tightens phase magnitude bound", testVariablePayloadUsesCurrentPhaseMagnitudeBound);
     run("G711 sequence gap overrides bounded raw phase", testSequenceGapOverridesBoundedRawPhase);
     run("G711 raw phase correction magnitude boundaries", testRawPhaseCorrectionMagnitudeBoundary);
+    run("G711 strict long-packet phase boundaries", testLongPacketPhaseBoundaries);
+    run("G711 long-packet allowance retains other boundaries", testLongPacketAllowanceKeepsOtherBoundaries);
+    run("G711 persistent long-packet phase and short-pause ambiguity", testPersistentLongPacketPhase);
     run("G711 return after bounded raw phase", testReturnAfterBoundedRawPhase);
     run("G711 decoder RTP and sequence wrap", testDecoderRtpAndSequenceWrap);
     run("G711 cache and timestamp wrapper compatibility", testCacheAndTimestampWrappers);

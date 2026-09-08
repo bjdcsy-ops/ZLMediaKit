@@ -10,6 +10,7 @@
 
 #include <cctype>
 #include <algorithm>
+#include <cstdlib>
 #include "RtpCodec.h"
 #include "RtspDemuxer.h"
 #include "Util/base64.h"
@@ -19,12 +20,39 @@ using namespace std;
 
 namespace mediakit {
 
+static bool hasLiveRange(const SdpTrack::Ptr &track) {
+    if (!track) {
+        return true;
+    }
+    auto range = track->_attr.equal_range("range");
+    for (auto it = range.first; it != range.second; ++it) {
+        auto value = toolkit::trim(std::string(it->second));
+        if (value == "npt=now-") {
+            continue;
+        }
+        if (value.compare(0, 4, "npt=") || value.empty() || value.back() != '-') {
+            return false;
+        }
+        auto start = value.substr(4, value.size() - 5);
+        char *end = nullptr;
+        auto position = std::strtod(start.c_str(), &end);
+        if (start.empty() || *end || position != 0) {
+            return false;
+        }
+    }
+    // Missing Range follows the existing live/unknown convention. A server
+    // that omits all VOD metadata cannot be identified here as seekable.
+    return true;
+}
+
 void RtspDemuxer::loadSdp(const string &sdp) {
     loadSdp(SdpParser(sdp));
 }
 
 void RtspDemuxer::loadSdp(const SdpParser &attr) {
+    auto titleTrack = attr.getTrack(TrackTitle);
     auto tracks = attr.getAvailableTrack();
+    const auto live_range = hasLiveRange(titleTrack) && std::all_of(tracks.begin(), tracks.end(), hasLiveRange);
     for (auto &track : tracks) {
         switch (track->_type) {
             case TrackVideo: {
@@ -33,6 +61,13 @@ void RtspDemuxer::loadSdp(const SdpParser &attr) {
                 break;
             case TrackAudio: {
                 makeAudioTrack(track);
+                if (_audio_rtp_decoder && _audio_track->getCodecId() == CodecAAC) {
+                    toolkit::Any fmtp;
+                    // loadSdp may reuse this decoder. Explicit VOD/unknown
+                    // ranges must clear a previous live-clock qualification.
+                    fmtp.set<std::string>(live_range ? track->_fmtp : "");
+                    _audio_rtp_decoder->setOpt(RtpCodec::RTP_DECODER_AAC_LIVE_FMTP, fmtp);
+                }
             }
                 break;
             default:
@@ -43,7 +78,6 @@ void RtspDemuxer::loadSdp(const SdpParser &attr) {
     // rtsp can immediately know how many tracks there are through sdp
     addTrackCompleted();
 
-    auto titleTrack = attr.getTrack(TrackTitle);
     if (titleTrack) {
         _duration = titleTrack->_duration;
     }

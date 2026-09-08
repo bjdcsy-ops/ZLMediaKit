@@ -58,7 +58,7 @@ def timestamp_bounce(index, amplitude, hold_packets):
 
 class Camera(threading.Thread):
     def __init__(self, fixture, audio_rate=16000, audio_codec="PCMU", bounce_ms=0, sr_jitter_ms=0,
-                 bounce_hold_packets=1):
+                 bounce_hold_packets=1, batch_timestamps=False):
         super().__init__(daemon=True)
         self.units, config = hevc_units(fixture)
         self.sock = socket.socket()
@@ -74,6 +74,7 @@ class Camera(threading.Thread):
         self.bounce_ticks = round(bounce_ms * audio_rate / 1000)
         self.bounce_hold_packets = bounce_hold_packets
         self.sr_jitter_ms = sr_jitter_ms
+        self.batch_timestamps = batch_timestamps
         params = ";".join(f"sprop-{name}={base64.b64encode(config[k]).decode()}"
                           for k, name in ((32, "vps"), (33, "sps"), (34, "pps")))
         self.sdp = ("v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=Clock fixture\r\n"
@@ -151,13 +152,15 @@ class Camera(threading.Thread):
             counts[track] += 1
             octets[track] += len(payload)
 
-        index = 0
+        index, audio_offset = 0, 0
+        payload_period = 251 if self.batch_timestamps else 256
         while not self.stop_event.is_set():
             if self.stop_event.wait(max(0, started + index * .04 - time.monotonic())):
                 break
             samples = self.audio_rate * 40 // 1000
-            # Continuous 40 ms payloads with held negative/positive source
-            # phase offsets. Never delay or duplicate a source packet.
+            # Source phase offsets follow the 40 ms video/source period.
+            # Batched audio carries 48/32 ms of samples in alternating groups,
+            # so each pair still covers exactly 80 ms without duplicating audio.
             bounce = timestamp_bounce(index, self.bounce_ticks, self.bounce_hold_packets)
             stamps = [base[0] + index * 3600, base[1] + index * samples + bounce]
             for pos, nal in enumerate(self.units[index % 25]):
@@ -171,7 +174,10 @@ class Camera(threading.Thread):
                         fu = bytes([(nal[0] & 0x81) | (49 << 1), nal[1],
                                     (nal[0] >> 1 & 63) | (0x80 if off == 0 else 0) | (0x40 if end else 0)])
                         rtp(0, fu + body[off:off + 1197], stamps[0], last and end)
-            rtp(1, bytes((index * samples + i) & 255 for i in range(samples)), stamps[1], True)
+            packet_samples = self.audio_rate * 16 // 1000 if self.batch_timestamps else samples
+            for _ in range(3 - index % 2 if self.batch_timestamps else 1):
+                rtp(1, bytes((audio_offset + i) % payload_period for i in range(packet_samples)), stamps[1], True)
+                audio_offset += packet_samples
             if index % (25 if self.sr_jitter_ms else 125) == 0:
                 ntp = epoch + index * .04 + 2208988800
                 for track in (0, 1):
@@ -392,13 +398,17 @@ def main():
     parser.add_argument("--audio-codec", choices=["PCMA", "PCMU"], default="PCMU")
     parser.add_argument("--bounce-ms", type=float, default=0, help="Transient audio RTP timestamp offset, not a sample gap")
     parser.add_argument("--bounce-hold-packets", type=int, choices=range(1, 9), default=1,
-                        help="Consecutive packets per negative/positive phase; default 1 preserves the original fixture")
+                        help="Consecutive 40 ms source periods per negative/positive phase; default 1 preserves the original fixture")
+    parser.add_argument("--batch-timestamps", action="store_true",
+                        help="Alternate groups of 3/2 contiguous 16 ms G711 packets sharing each 40 ms source timestamp")
     parser.add_argument("--sr-jitter-ms", type=float, default=0, help="Alternating audio-only SR/NTP anchor offset each second")
     args = parser.parse_args()
     if args.duration < 12 or not 0 <= args.bounce_ms < 40 or not 0 <= args.sr_jitter_ms <= 10:
         parser.error("duration must be >=12 seconds; bounce in [0,40) ms; SR jitter in [0,10] ms")
+    if args.batch_timestamps and args.audio_rate * 16 % 1000:
+        parser.error("batch timestamps require an audio rate with an integral 16 ms sample count")
     camera = Camera(args.fixture, args.audio_rate, args.audio_codec, args.bounce_ms, args.sr_jitter_ms,
-                    args.bounce_hold_packets)
+                    args.bounce_hold_packets, args.batch_timestamps)
     camera.start()
     process = relay = None
     with tempfile.TemporaryDirectory(prefix="zlm-g711-clock-") as temporary:
@@ -441,7 +451,8 @@ def main():
                 report = check_stream(input_url, args.duration, audio_rate=args.audio_rate)
                 report["source_case"] = dict(codec=args.audio_codec, rate=args.audio_rate,
                                              bounce_ms=args.bounce_ms, sr_jitter_ms=args.sr_jitter_ms,
-                                             bounce_hold_packets=args.bounce_hold_packets)
+                                             bounce_hold_packets=args.bounce_hold_packets,
+                                             batch_timestamps=args.batch_timestamps)
                 if args.ffmpeg:
                     output_url = f"rtsp://127.0.0.1:{rtsp}/live/4"
                     with (root / "ffmpeg.log").open("w") as relay_log:
