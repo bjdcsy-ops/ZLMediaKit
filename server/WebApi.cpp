@@ -460,6 +460,8 @@ Value ToJson(const PlayerProxy::Ptr& p) {
     item["url"] = p->getUrl();
     item["status"] = p->getStatus();
     item["status_str"] = p->getStatusStr();
+    item["inputClockRequested"] = p->getInputClockRequested();
+    item["inputClockMode"] = p->getInputClockMode();
     item["liveSecs"] = p->getLiveSecs();
     item["rePullCount"] = p->getRePullCount();
     item["totalReaderCount"] = p->totalReaderCount();
@@ -2618,6 +2620,10 @@ void installWebApi() {
         }
         
         player_proxy->getPoller()->async([=]() mutable {
+            if (player_proxy->getInputClockMode() == 1 && speed != 1.0f) {
+                responseApi(API::InvalidArgs, "rtsp_input_clock requires live playback at normal speed", invoker);
+                return;
+            }
             player_proxy->MediaPlayer::speed(speed);
             val["result"] = 0;
             val["msg"] = "success";
@@ -2645,6 +2651,10 @@ void installWebApi() {
         }
         
         player_proxy->getPoller()->async([=]() mutable {
+            if (player_proxy->getInputClockMode() == 1) {
+                responseApi(API::InvalidArgs, "rtsp_input_clock does not support pause/resume; reopen without the option for playback", invoker);
+                return;
+            }
             player_proxy->MediaPlayer::pause(true);
             val["result"] = 0;
             val["msg"] = "success";
@@ -2673,6 +2683,10 @@ void installWebApi() {
         }
         
         player_proxy->getPoller()->async([=]() mutable {
+            if (player_proxy->getInputClockMode() == 1) {
+                responseApi(API::InvalidArgs, "rtsp_input_clock does not support seeking; reopen without the option for playback", invoker);
+                return;
+            }
             player_proxy->MediaPlayer::seekTo(pos);
             val["result"] = 0;
             val["msg"] = "success";

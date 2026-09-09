@@ -256,6 +256,8 @@ public:
     RtpPacket::Ptr inputRtp(TrackType type, int sample_rate, uint8_t *ptr, size_t len);
     void setNtpStamp(uint32_t rtp_stamp, uint64_t ntp_stamp_ms);
     void setPayloadType(uint8_t pt);
+    // A live RTSP session may map timestamps itself after sorting.
+    void setNtpMappingEnabled(bool enabled) { _ntp_mapping_enabled = enabled; }
 
 protected:
     virtual void onRtpSorted(RtpPacket::Ptr rtp) {}
@@ -263,6 +265,7 @@ protected:
 
 private:
     bool _disable_ntp = false;
+    bool _ntp_mapping_enabled = true;
     uint8_t _pt = 0xFF;
     uint32_t _ssrc = 0;
     toolkit::Ticker _ssrc_alive;
@@ -349,6 +352,12 @@ public:
     void setPayloadType(int index, uint8_t pt){
         assert(index < kCount && index >= 0);
         _track[index].setPayloadType(pt);
+    }
+
+    void setNtpMappingEnabled(bool enabled) {
+        for (auto &track : _track) {
+            track.setNtpMappingEnabled(enabled);
+        }
     }
 
     void clear() {

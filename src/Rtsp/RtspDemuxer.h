@@ -51,6 +51,8 @@ public:
      * [AUTO-TRANSLATED:6b2ec56c]
      */
     float getDuration() const;
+    bool isLive() const { return _live; }
+    static bool isLiveSdp(const SdpParser &parser);
 
 private:
     void makeAudioTrack(const SdpTrack::Ptr &audio);
@@ -59,6 +61,7 @@ private:
 
 private:
     float _duration = 0;
+    bool _live = false;
     AudioTrack::Ptr _audio_track;
     VideoTrack::Ptr _video_track;
     RtpCodec::Ptr _audio_rtp_decoder;

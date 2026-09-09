@@ -13,6 +13,7 @@
 
 #include <string>
 #include <memory>
+#include <atomic>
 #include "Util/TimeTicker.h"
 #include "Poller/Timer.h"
 #include "Network/Socket.h"
@@ -20,6 +21,7 @@
 #include "Network/TcpClient.h"
 #include "RtspSplitter.h"
 #include "RtpReceiver.h"
+#include "RtspInputClock.h"
 #include "Rtcp/RtcpContext.h"
 
 namespace mediakit {
@@ -42,6 +44,7 @@ public:
 
     size_t getRecvSpeed() override;
     size_t getRecvTotalBytes() override;
+    int getInputClockMode() const { return _input_clock_active.load() ? 1 : 0; }
 
 protected:
     // 派生类回调函数  [AUTO-TRANSLATED:61e20903]
@@ -50,6 +53,7 @@ protected:
     virtual void onRecvRTP(RtpPacket::Ptr rtp, const SdpTrack::Ptr &track) = 0;
     uint32_t getProgressMilliSecond() const;
     void seekToMilliSecond(uint32_t ms);
+    void setInputClockEnabled(bool eligible);
 
     /**
      * 收到完整的rtsp包回调，包括sdp等content数据
@@ -146,6 +150,11 @@ private:
     // 是否为性能测试模式  [AUTO-TRANSLATED:1fde8234]
     // Whether it is performance test mode
     bool _benchmark_mode = false;
+    bool _input_clock_enabled = false;
+    bool _input_clock_live_sdp = false;
+    uint8_t _input_clock_seen = 0;
+    std::atomic<bool> _input_clock_active { false };
+    RtspInputClock _input_clock;
     // 轮流发送rtcp与GET_PARAMETER保活  [AUTO-TRANSLATED:5b6f9c37]
     // Send rtcp and GET_PARAMETER keep-alive in turn
     bool _send_rtcp[2] = {true, true};

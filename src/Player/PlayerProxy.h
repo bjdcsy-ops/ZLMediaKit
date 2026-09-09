@@ -119,6 +119,7 @@ public:
      * [AUTO-TRANSLATED:a2f0e859]
      */
     void play(const std::string &strUrl) override;
+    void teardown() override;
 
     /**
      * 获取观看总人数
@@ -129,6 +130,8 @@ public:
     int totalReaderCount();
 
     int getStatus();
+    int getInputClockRequested() const { return _input_clock_requested.load(); }
+    int getInputClockMode() const;
     std::string getStatusStr() const;
     uint64_t getLiveSecs();
     uint64_t getRePullCount();
@@ -182,6 +185,9 @@ private:
     // 0 表示正常 1 表示正在尝试拉流  [AUTO-TRANSLATED:2080bedf]
     // 0 indicates normal, 1 indicates attempting to stream
     std::atomic<int> _live_status;
+    // API readers must not touch the mutable player delegate or option map.
+    std::atomic<int> _input_clock_requested { 0 };
+    std::atomic<int> _input_clock_mode { 0 };
     std::atomic<uint64_t> _live_secs;
 
     std::atomic<uint64_t> _repull_count;

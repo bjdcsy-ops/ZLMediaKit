@@ -605,6 +605,9 @@ extern const std::string kNetAdapter;
 // 设置方法:player[PlayerBase::kRtpType] = 0/1/2;  [AUTO-TRANSLATED:30eb2936]
 // Set method: player[PlayerBase::kRtpType] = 0/1/2;
 extern const std::string kRtpType;
+// Live RTSP input media clock: 0 (default) keeps native SR re-anchoring;
+// 1 opts into continuous input timestamps on a non-direct live pull session.
+extern const std::string kRtspInputClock;
 // rtsp播放器发送信令心跳还是rtcp心跳，可选项有0(同时发)、1(rtcp心跳)、2(信令心跳)  [AUTO-TRANSLATED:56d9ac7c]
 // Whether the RTSP player sends signaling heartbeat or RTCP heartbeat, options are 0 (both), 1 (RTCP heartbeat), 2 (signaling heartbeat)
 // 设置方法:player[PlayerBase::kRtspBeatType] = 0/1/2;  [AUTO-TRANSLATED:ccc0726b]

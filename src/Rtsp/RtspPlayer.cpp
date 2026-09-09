@@ -23,6 +23,7 @@
 #include <set>
 #include <cstring>
 #include <ctime>
+#include <chrono>
 
 #if defined(_WIN32)
 #include "Util/strptime_win.h"
@@ -35,6 +36,11 @@ namespace mediakit {
 
 enum PlayType { type_play = 0, type_pause, type_seek, type_speed };
 enum class BeatType : uint32_t { both = 0, rtcp, cmd  };
+
+static int64_t inputClockNowUs() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 
 RtspPlayer::RtspPlayer(const EventPoller::Ptr &poller)
     : TcpClient(poller) {}
@@ -53,6 +59,12 @@ void RtspPlayer::sendTeardown() {
 }
 
 void RtspPlayer::teardown() {
+    _input_clock_enabled = false;
+    _input_clock_live_sdp = false;
+    _input_clock_seen = 0;
+    _input_clock_active = false;
+    _input_clock.reset();
+    setNtpMappingEnabled(true);
     sendTeardown();
     _md5_nonce.clear();
     _realm.clear();
@@ -217,6 +229,9 @@ void RtspPlayer::handleResDESCRIBE(const Parser &parser) {
     // 解析sdp  [AUTO-TRANSLATED:ed3f07fe]
     // Parse SDP
     SdpParser sdpParser(parser.content());
+    // Serialization normalizes title ranges. Qualify this opt-in mode against
+    // the original response before that can erase explicit replay metadata.
+    _input_clock_live_sdp = RtspDemuxer::isLiveSdp(sdpParser);
 
     // 保存 range 信息（从第一个 track 获取）
     auto tracks = sdpParser.getAvailableTrack();
@@ -542,10 +557,18 @@ void RtspPlayer::sendPause(int type, uint32_t seekMS) {
 }
 
 void RtspPlayer::pause(bool bPause) {
+    if (_input_clock_enabled) {
+        WarnL << "rtsp_input_clock does not support pause/resume; reopen without the option for playback";
+        return;
+    }
     sendPause(bPause ? type_pause : type_seek, getProgressMilliSecond());
 }
 
 void RtspPlayer::speed(float speed) {
+    if (_input_clock_enabled && speed != 1.0f) {
+        WarnL << "rtsp_input_clock requires live playback at normal speed";
+        return;
+    }
     sendRtspRequest("PLAY", _control_url, { "Scale", StrPrinter << speed });
 }
 
@@ -652,12 +675,27 @@ void RtspPlayer::onRtcpPacket(int track_idx, SdpTrack::Ptr &track, uint8_t *data
             auto sr = (RtcpSR *)(rtcp);
             // 设置rtp时间戳与ntp时间戳的对应关系  [AUTO-TRANSLATED:e92f4749]
             // Set the correspondence between RTP timestamp and NTP timestamp
-            setNtpStamp(track_idx, sr->rtpts, sr->getNtpUnixStampMS());
+            if (_input_clock_enabled) {
+                _input_clock.inputSr(track_idx, sr->ssrc, sr->rtpts,
+                    int64_t(sr->getNtpUnixStampMS()) * 1000, inputClockNowUs());
+            } else {
+                setNtpStamp(track_idx, sr->rtpts, sr->getNtpUnixStampMS());
+            }
         }
     }
 }
 
 void RtspPlayer::onRtpSorted(RtpPacket::Ptr rtppt, int trackidx) {
+    if (_input_clock_enabled) {
+        rtppt->ntp_stamp = _input_clock.inputRtp(trackidx, rtppt->getSSRC(), rtppt->getStamp(),
+            rtppt->sample_rate, inputClockNowUs(), getCurrentMicrosecond(true),
+            rtppt->type == TrackAudio, rtppt->getSeq());
+        if (!(_input_clock_seen & (1 << trackidx))) {
+            _input_clock_seen |= 1 << trackidx;
+            DebugL << "RTSP input clock track=" << trackidx << " SSRC=" << rtppt->getSSRC()
+                   << " bootstrap=" << (_input_clock.hasInitialSr(trackidx) ? "accepted early SR" : "arrival fallback");
+        }
+    }
     _stamp[trackidx] = rtppt->getStampMS();
     if (!_first_stamp[trackidx]) {
         _first_stamp[trackidx] = _stamp[trackidx];
@@ -693,7 +731,22 @@ uint32_t RtspPlayer::getProgressMilliSecond() const {
 }
 
 void RtspPlayer::seekToMilliSecond(uint32_t ms) {
+    if (_input_clock_enabled) {
+        WarnL << "rtsp_input_clock does not support seeking; reopen without the option for playback";
+        return;
+    }
     sendPause(type_seek, ms);
+}
+
+void RtspPlayer::setInputClockEnabled(bool eligible) {
+    _input_clock_enabled = eligible && _input_clock_live_sdp && (*this)[Client::kRtspInputClock].as<int>() == 1
+        && (_speed == 0.0f || _speed == 1.0f) && _custom_header.find("Range") == _custom_header.end()
+        && _custom_header.find("Scale") == _custom_header.end()
+        && !(*this)[Client::kBenchmarkMode].as<bool>();
+    _input_clock_active = false;
+    _input_clock_seen = 0;
+    _input_clock.reset();
+    setNtpMappingEnabled(!_input_clock_enabled);
 }
 
 void RtspPlayer::sendRtspRequest(const string &cmd, const string &url, const std::initializer_list<string> &header) {
@@ -837,6 +890,7 @@ void RtspPlayer::onBeforeRtpSorted(const RtpPacket::Ptr &rtp, int track_idx) {
 }
 
 void RtspPlayer::onPlayResult_l(const SockException &ex, bool handshake_done) {
+    _input_clock_active = !ex && _input_clock_enabled;
     if (ex.getErrCode() == Err_shutdown) {
         // 主动shutdown的，不触发回调  [AUTO-TRANSLATED:21f9c396]
         // Active shutdown, do not trigger callback
@@ -988,6 +1042,7 @@ bool RtspPlayerImp::onCheckSDP(const std::string &sdp) {
     _demuxer = std::make_shared<RtspDemuxer>();
     _demuxer->setTrackListener(this, (*this)[Client::kWaitTrackReady].as<bool>());
     _demuxer->loadSdp(sdp);
+    setInputClockEnabled(!_rtsp_media_src && _demuxer->isLive());
     return true;
 }
 

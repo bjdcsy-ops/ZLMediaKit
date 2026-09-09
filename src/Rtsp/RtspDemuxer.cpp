@@ -49,10 +49,17 @@ void RtspDemuxer::loadSdp(const string &sdp) {
     loadSdp(SdpParser(sdp));
 }
 
+bool RtspDemuxer::isLiveSdp(const SdpParser &parser) {
+    auto tracks = parser.getAvailableTrack();
+    return hasLiveRange(parser.getTrack(TrackTitle))
+        && std::all_of(tracks.begin(), tracks.end(), hasLiveRange);
+}
+
 void RtspDemuxer::loadSdp(const SdpParser &attr) {
     auto titleTrack = attr.getTrack(TrackTitle);
     auto tracks = attr.getAvailableTrack();
-    const auto live_range = hasLiveRange(titleTrack) && std::all_of(tracks.begin(), tracks.end(), hasLiveRange);
+    const auto live_range = isLiveSdp(attr);
+    _live = live_range;
     for (auto &track : tracks) {
         switch (track->_type) {
             case TrackVideo: {

@@ -110,6 +110,7 @@ void PlayerProxy::update(const std::string &url, const toolkit::mINI &args) {
     for (auto &pr : args) {
         (*this)[pr.first] = pr.second;
     }
+    _input_clock_requested = (*this)[Client::kRtspInputClock].as<int>() == 1 ? 1 : 0;
 }
 
 void PlayerProxy::setPlayCallbackOnce(function<void(const SockException &ex)> cb) {
@@ -171,6 +172,8 @@ static int getMaxTrackSize(const std::string &url) {
 
 void PlayerProxy::play(const string &url) {
     _pull_url = url;
+    _input_clock_requested = (*this)[Client::kRtspInputClock].as<int>() == 1 ? 1 : 0;
+    _input_clock_mode = 0;
     _option.max_track = getMaxTrackSize(_pull_url);
     weak_ptr<PlayerProxy> weakSelf = shared_from_this();
     std::shared_ptr<int> piFailedCnt(new int(0)); // 连续播放失败次数
@@ -183,6 +186,9 @@ void PlayerProxy::play(const string &url) {
             NOTICE_EMIT(BroadcastPlayerProxyFailedArgs, Broadcast::kBroadcastPlayerProxyFailed, *strongSelf, err);
             strongSelf->_status = std::make_shared<std::string>(std::string("play failed: ") + err.what());
         }
+        auto rtsp_player = err ? nullptr : std::dynamic_pointer_cast<RtspPlayer>(strongSelf->_delegate);
+        strongSelf->_input_clock_mode = rtsp_player ? rtsp_player->getInputClockMode() : 0;
+        strongSelf->_live_status = err ? 1 : 0;
         if (strongSelf->_on_play) {
             strongSelf->_on_play(err);
             strongSelf->_on_play = nullptr;
@@ -221,6 +227,8 @@ void PlayerProxy::play(const string &url) {
         if (!strongSelf) {
             return;
         }
+        strongSelf->_input_clock_mode = 0;
+        strongSelf->_live_status = 1;
         if (err) {
             NOTICE_EMIT(BroadcastPlayerProxyFailedArgs, Broadcast::kBroadcastPlayerProxyFailed, *strongSelf, err);
         }
@@ -269,6 +277,7 @@ void PlayerProxy::play(const string &url) {
         }
     });
     try {
+        _live_status = 1;
         _status = std::make_shared<std::string>("connecting");
         MediaPlayer::play(_pull_url );
     } catch (std::exception &ex) {
@@ -278,6 +287,15 @@ void PlayerProxy::play(const string &url) {
         return;
     }
     setDirectProxy();
+}
+
+int PlayerProxy::getInputClockMode() const {
+    return _input_clock_mode.load();
+}
+
+void PlayerProxy::teardown() {
+    _input_clock_mode = 0;
+    MediaPlayer::teardown();
 }
 
 void PlayerProxy::setDirectProxy() {
@@ -331,6 +349,9 @@ void PlayerProxy::rePlay(int iFailedCnt) {
             return false;
         }
         WarnL << "重试播放[" << iFailedCnt << "]:" << strongPlayer->_pull_url;
+        strongPlayer->_input_clock_requested = (*strongPlayer)[Client::kRtspInputClock].as<int>() == 1 ? 1 : 0;
+        strongPlayer->_input_clock_mode = 0;
+        strongPlayer->_live_status = 1;
         strongPlayer->MediaPlayer::play(strongPlayer->_pull_url);
         strongPlayer->setDirectProxy();
         return false;
