@@ -1368,9 +1368,8 @@ void testCapturedBatchTimestampReplay() {
             require(exact.sample_stamp == first_sample + elapsed_samples,
                     "captured G711 batch timestamp moved the segment sample axis" + context);
             if (initial_boundary && sorted == 1) {
-                // NtpStamp uses float conversion before millisecond rounding
-                // (800 samples can map to 49 ms). A real boundary adopts that
-                // receiver mapping, while its sample origin keeps the raw gap.
+                // A real boundary adopts the receiver's millisecond mapping,
+                // while its sample origin keeps the raw gap.
                 segment_ntp_us = packet->getStampMS() * 1000;
                 segment_samples = decoded_samples;
             }

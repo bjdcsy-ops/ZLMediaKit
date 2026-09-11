@@ -239,7 +239,7 @@ void testRtpTimestampWrapReordering() {
 
 void testRtpTimestampAnomalyBoundaries() {
     // Preserve the existing 3-second anomaly threshold and 60-second wrap
-    // neighborhood; this patch only changes the arithmetic of accepted wraps.
+    // neighborhood; exact tick-boundary checks are covered separately below.
     NtpStamp clock;
     clock.setNtpStamp(160000, 1000000);
     require(std::abs(int64_t(clock.getNtpStamp(160000 + 2800 * 16, 16000)) - 1002800) <= 1,
@@ -256,6 +256,172 @@ void testRtpTimestampAnomalyBoundaries() {
     clock.setNtpStamp(0xffffff00U, 1000000);
     require(clock.getNtpStamp(960000, 16000) == 1000000,
             "wrap neighborhood was widened past its existing strict boundary");
+}
+
+void requireNtpStamp(NtpStamp &clock, uint32_t raw, uint32_t rate, uint64_t expected, const char *context) {
+    const auto actual = clock.getNtpStamp(raw, rate);
+    if (actual != expected) {
+        throw std::runtime_error(std::string(context) + ": rate=" + std::to_string(rate)
+            + ", raw=" + std::to_string(raw) + ", actual_ms=" + std::to_string(actual)
+            + ", expected_ms=" + std::to_string(expected));
+    }
+}
+
+void testNtpLongRunningSampleClock() {
+    constexpr uint32_t origin = 123456;
+    constexpr uint64_t ntp_start = 1000000;
+    for (uint32_t rate : { 8000, 16000, 32000, 44100, 48000, 64000 }) {
+        NtpStamp clock;
+        clock.setNtpStamp(origin, ntp_start);
+        const uint64_t frames = uint64_t(rate) * 21 * 3600 / 1024;
+        for (uint64_t i = 1; i <= frames; ++i) {
+            // Compare every observation with the absolute sample count, without
+            // another SR or an independently accumulated microsecond clock.
+            const auto ticks = i * 1024;
+            requireNtpStamp(clock, uint32_t(origin + ticks), rate, ntp_start + ticks * 1000 / rate,
+                            "21-hour sample clock accumulated conversion error");
+        }
+        std::cout << "METRIC NTP sample clock rate=" << rate << " frames=" << frames
+                  << " elapsed_ms=" << frames * 1024 * 1000 / rate
+                  << " rtp_wraps=" << (origin + frames * 1024) / (uint64_t(1) << 32)
+                  << " error_ms=0" << std::endl;
+    }
+}
+
+void testNtpFractionalWrapAndReordering() {
+    constexpr uint64_t ntp_start = 1000000;
+    for (uint32_t rate : { 8000, 16000, 32000, 44100, 48000, 64000 }) {
+        constexpr uint32_t origin = uint32_t(0U - 2000);
+        NtpStamp clock;
+        clock.setNtpStamp(origin, ntp_start);
+        // The first observation establishes a fractional phase before wrap.
+        // Later observations include duplicates, late pre-wrap packets and
+        // ordinary reordering, followed by enough progress to expose lost phase.
+        for (uint64_t ticks : { 1024, 2048, 2048, 1024, 1536, 3072, 2048, 3072 }) {
+            requireNtpStamp(clock, uint32_t(origin + ticks), rate, ntp_start + ticks * 1000 / rate,
+                            "wrap or reordered query changed its sample-clock mapping");
+        }
+        for (uint64_t i = 4; i <= 5000; ++i) {
+            const auto ticks = i * 1024;
+            requireNtpStamp(clock, uint32_t(origin + ticks), rate, ntp_start + ticks * 1000 / rate,
+                            "wrap or reordered query changed advancing fractional phase");
+        }
+    }
+
+    // At 90001 Hz, 90 ticks fall less than one microsecond below 1 ms.
+    // This makes an incorrect backward rounding direction visible through
+    // the public millisecond API in both ordinary and cross-wrap reordering.
+    constexpr uint32_t rate = 90001;
+    constexpr uint32_t origin = uint32_t(0U - 91);
+    NtpStamp clock;
+    clock.setNtpStamp(origin, ntp_start);
+    for (uint64_t ticks : { 90, 92, 90, 92, 180, 181, 180, 182, 90001 }) {
+        requireNtpStamp(clock, uint32_t(origin + ticks), rate, ntp_start + ticks * 1000 / rate,
+                        "backward query did not retain the advancing fractional phase");
+    }
+
+    // Here the backward tick numerator is smaller than the anchor remainder.
+    // Also check backward rounding across an exact millisecond.
+    NtpStamp fine_clock;
+    fine_clock.setNtpStamp(1000000, 1);
+    requireNtpStamp(fine_clock, 1000002, 3000000, 1, "sub-microsecond forward step changed");
+    requireNtpStamp(fine_clock, 1000001, 3000000, 1, "backward numerator underflowed below the remainder");
+    requireNtpStamp(fine_clock, 999999, 3000000, 0, "sub-microsecond backward result did not round down");
+    requireNtpStamp(fine_clock, 1000002, 3000000, 1, "sub-microsecond query moved the advancing anchor");
+    requireNtpStamp(fine_clock, 1003000, 3000000, 2, "sub-microsecond phase was lost after reordering");
+}
+
+void testNtpSenderReportClearsFractionalPhase() {
+    constexpr uint32_t rate = 90001;
+    constexpr uint32_t origin = 1000000;
+    constexpr uint64_t ntp_start = 1000000;
+    for (uint64_t recalibrated : { 2000000, 500000 }) {
+        NtpStamp clock;
+        clock.setNtpStamp(origin, ntp_start);
+        requireNtpStamp(clock, origin + 90, rate, ntp_start, "fractional SR setup changed");
+        clock.setNtpStamp(origin + 90, recalibrated);
+        requireNtpStamp(clock, origin + 90, rate, recalibrated, "new SR did not immediately replace its anchor");
+        requireNtpStamp(clock, origin + 180, rate, recalibrated,
+                        "new SR retained the previous fractional phase");
+        requireNtpStamp(clock, origin + 90 + rate, rate, recalibrated + 1000,
+                        "new SR sample-clock progression changed");
+    }
+}
+
+void testNtpAnomalyClearsFractionalPhase() {
+    constexpr uint32_t rate = 44100;
+    constexpr uint32_t origin = rate * 10;
+    constexpr uint64_t ntp_start = 1000000;
+    constexpr uint32_t initial_ticks = 1024;
+    const uint64_t retained_us = ntp_start * 1000 + uint64_t(initial_ticks) * 1000000 / rate;
+    const uint32_t following_ticks = rate - initial_ticks;
+    for (int direction : { -1, 1 }) {
+        NtpStamp clock;
+        clock.setNtpStamp(origin, ntp_start);
+        requireNtpStamp(clock, origin + initial_ticks, rate, retained_us / 1000,
+                        "fractional anomaly setup changed");
+        const auto restarted_raw = uint32_t(int64_t(origin + initial_ticks) + direction * int64_t(rate) * 4);
+        requireNtpStamp(clock, restarted_raw, rate, retained_us / 1000,
+                        "abnormal timestamp jump did not retain its integer anchor");
+        const auto expected = (retained_us + uint64_t(following_ticks) * 1000000 / rate) / 1000;
+        requireNtpStamp(clock, restarted_raw + following_ticks, rate, expected,
+                        "abnormal timestamp jump retained its old fractional phase");
+    }
+}
+
+void testNtpSampleRateChangeClearsFractionalPhase() {
+    constexpr uint32_t origin = 1000000;
+    constexpr uint32_t old_rate = 90001;
+    constexpr uint32_t new_rate = 16000;
+    constexpr uint64_t ntp_start = 1000000;
+    const uint64_t retained_us = ntp_start * 1000 + uint64_t(90) * 1000000 / old_rate;
+    for (bool duplicate_first : { false, true }) {
+        NtpStamp clock;
+        clock.setNtpStamp(origin, ntp_start);
+        requireNtpStamp(clock, origin + 90, old_rate, ntp_start, "fractional rate-change setup changed");
+        if (duplicate_first) {
+            requireNtpStamp(clock, origin + 90, new_rate, retained_us / 1000,
+                            "rate change moved the integer anchor of a duplicate");
+        }
+        for (uint64_t i = 1; i <= 100; ++i) {
+            const auto ticks = i * 16;
+            requireNtpStamp(clock, uint32_t(origin + 90 + ticks), new_rate,
+                            (retained_us + ticks * 1000000 / new_rate) / 1000,
+                            "rate change reused a remainder with the old denominator");
+        }
+    }
+
+    NtpStamp clock;
+    clock.setNtpStamp(origin, ntp_start);
+    requireNtpStamp(clock, origin + 90, old_rate, ntp_start, "duplicate rate-change setup changed");
+    requireNtpStamp(clock, origin + 90, new_rate, ntp_start, "duplicate rate change moved the integer anchor");
+    requireNtpStamp(clock, origin + 90, old_rate, ntp_start, "returning to the old rate moved the integer anchor");
+    requireNtpStamp(clock, origin + old_rate, old_rate,
+                    (retained_us + uint64_t(old_rate - 90) * 1000000 / old_rate) / 1000,
+                    "duplicate rate changes restored a discarded fractional phase");
+}
+
+void testNtpExactThreeSecondBoundaries() {
+    constexpr uint64_t ntp_start = 1000000;
+    for (uint32_t rate : { 8000, 16000, 32000, 44100, 48000, 64000, 90000 }) {
+        const uint32_t origin = rate * 10;
+        for (int direction : { -1, 1 }) {
+            for (int adjustment : { -1, 0, 1 }) {
+                NtpStamp clock;
+                clock.setNtpStamp(origin, ntp_start);
+                const auto ticks = uint32_t(int64_t(rate) * 3 + adjustment);
+                const auto raw = uint32_t(int64_t(origin) + direction * int64_t(ticks));
+                const auto expected = adjustment >= 0 ? ntp_start
+                    : uint64_t(int64_t(ntp_start * rate) + direction * int64_t(ticks) * 1000) / rate;
+                requireNtpStamp(clock, raw, rate, expected,
+                                "three-second anomaly boundary differs from its exact tick span");
+                if (adjustment >= 0) {
+                    requireNtpStamp(clock, raw + rate / 50, rate, ntp_start + 20,
+                                    "rejected timestamp span did not establish the next RTP anchor");
+                }
+            }
+        }
+    }
 }
 
 void testNewSsrcKeepsAnAlreadyReceivedSenderReport() {
@@ -659,12 +825,14 @@ void testConsistentFullPipeline() {
 int main(int argc, char **argv) {
     const bool verify_sr = argc == 2 && std::string(argv[1]) == "--verify-sr-reanchor";
     const bool verify_wrap = argc == 2 && std::string(argv[1]) == "--verify-rtp-wrap";
-    if (argc > 1 && !verify_sr && !verify_wrap) {
-        std::cout << "Usage: " << argv[0] << " [--verify-sr-reanchor | --verify-rtp-wrap]\n"
+    const bool verify_precision = argc == 2 && std::string(argv[1]) == "--verify-ntp-precision";
+    if (argc > 1 && !verify_sr && !verify_wrap && !verify_precision) {
+        std::cout << "Usage: " << argv[0] << " [--verify-sr-reanchor | --verify-rtp-wrap | --verify-ntp-precision]\n"
                   << "Default: upstream clock compatibility and a synthetic consistent-SR full pipeline.\n"
                   << "--verify-sr-reanchor: unchanged field RTP/SR replay through receiver and real codecs/muxer;\n"
                   << "returns failure while the separately tracked SR reanchor issue remains unresolved.\n"
-                  << "--verify-rtp-wrap: strict timestamp-wrap precision and boundary checks.\n";
+                  << "--verify-rtp-wrap: strict timestamp-wrap precision and boundary checks.\n"
+                  << "--verify-ntp-precision: long-running sample clocks, fractional phase and exact anomaly boundaries.\n";
         return argc == 2 && std::string(argv[1]) == "--help" ? EXIT_SUCCESS : EXIT_FAILURE;
     }
     unsigned failures = 0;
@@ -694,7 +862,7 @@ int main(int argc, char **argv) {
         run("RTP timestamp wrap retains its exact media span", testRtpTimestampWrapPrecision);
         run("late pre-wrap packet retains its original time", testRtpTimestampWrapReordering);
         run("timestamp anomaly thresholds remain unchanged", testRtpTimestampAnomalyBoundaries);
-    } else {
+    } else if (!verify_precision) {
         run("consistent SR media progression", testConsistentSenderReportsKeepMediaIntervals);
         run("later SR remains authoritative", testSenderReportsRemainAuthoritative);
         run("late first SR and clear with a new source", testLateFirstSenderReportAndClear);
@@ -708,6 +876,14 @@ int main(int argc, char **argv) {
         run("RTP timestamp wrap retains its exact media span", testRtpTimestampWrapPrecision);
         run("late pre-wrap packet retains its original time", testRtpTimestampWrapReordering);
         run("timestamp anomaly thresholds remain unchanged", testRtpTimestampAnomalyBoundaries);
+    }
+    if (verify_precision || argc == 1) {
+        run("21-hour NTP sample clocks do not accumulate conversion error", testNtpLongRunningSampleClock);
+        run("fractional NTP phase survives wraps and reordered queries", testNtpFractionalWrapAndReordering);
+        run("sender reports replace the NTP anchor and fractional phase", testNtpSenderReportClearsFractionalPhase);
+        run("abnormal RTP jumps discard the previous fractional phase", testNtpAnomalyClearsFractionalPhase);
+        run("sample-rate changes discard the previous fractional phase", testNtpSampleRateChangeClearsFractionalPhase);
+        run("three-second anomaly boundaries use their exact tick spans", testNtpExactThreeSecondBoundaries);
     }
     return failures ? EXIT_FAILURE : EXIT_SUCCESS;
 }

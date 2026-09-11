@@ -185,12 +185,17 @@ public:
     uint64_t getNtpStamp(uint32_t rtp_stamp, uint32_t sample_rate);
 
 private:
-    void update(uint32_t rtp_stamp, uint64_t ntp_stamp_us);
+    void update(uint32_t rtp_stamp, uint64_t ntp_stamp_us, uint32_t remainder = 0);
+    uint64_t advance(uint32_t rtp_stamp, uint32_t sample_rate);
+    uint64_t getNtpStampBack(uint32_t rtp_stamp, uint32_t sample_rate) const;
     uint64_t getNtpStampUS(uint32_t rtp_stamp, uint32_t sample_rate);
 
 private:
     uint32_t _last_rtp_stamp = 0;
     uint64_t _last_ntp_stamp_us = 0;
+    uint32_t _last_sample_rate = 0;
+    // Fractional microseconds at the advancing anchor, with sample_rate as denominator.
+    uint32_t _ntp_stamp_remainder = 0;
 };
 
 }//namespace mediakit
